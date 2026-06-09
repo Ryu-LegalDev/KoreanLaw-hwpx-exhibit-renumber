@@ -49,6 +49,9 @@ EXHIBIT_A_LIST_RE = re.compile(r"^(?:\d+[\.\s]+)?갑\s*제\d+호증")
 EXHIBIT_B_RE = re.compile(r"을\s*제(\d+)호증")
 EXHIBIT_B_LIST_RE = re.compile(r"^(?:\d+[\.\s]+)?을\s*제\d+호증")
 
+# 갑호증 (번호 없음) — "갑 제호증" 패턴 (제와 호증 사이에 숫자 없음)
+EXHIBIT_A_NONUM_RE = re.compile(r"갑\s*제호증")
+
 # 을호증 (번호 없음) — "을 제호증" 패턴 (제와 호증 사이에 숫자 없음)
 EXHIBIT_B_NONUM_RE = re.compile(r"을\s*제호증")
 
@@ -58,6 +61,50 @@ REFERENCE_LIST_RE = re.compile(r"^(?:\d+[\.\s]+)?참고자료\s*\d+")
 
 # 마무리 섹션 헤더 키워드 (공백 제거 후 비교)
 SECTION_KEYWORDS = {"입증방법", "소명방법", "참고자료", "첨부서류", "첨부자료", "참고자료목록"}
+
+
+# ═══════════════════════════════════════════════════════════════
+# 전처리: 번호 없는 증거에 임시 번호 부여
+# ═══════════════════════════════════════════════════════════════
+def preprocess_all_unnumbered(paragraphs):
+    """
+    번호 없는 '갑 제호증', '을 제호증'에 임시 번호를 부여.
+    기존 최대 번호 + 1부터 순차 부여하여, 이후 정렬 로직이 통일 처리 가능.
+    """
+    for numbered_re, unnumbered_re, label in [
+        (EXHIBIT_A_RE, EXHIBIT_A_NONUM_RE, "갑호증"),
+        (EXHIBIT_B_RE, EXHIBIT_B_NONUM_RE, "을호증"),
+    ]:
+        # 현재 최대 번호 확인
+        max_n = 0
+        has_unnumbered = False
+        for para_el in paragraphs:
+            text = get_para_texts(para_el)
+            for m in numbered_re.finditer(text):
+                max_n = max(max_n, int(m.group(1)))
+            # 이미 번호가 붙은 부분을 제거한 뒤 번호 없는 패턴 확인
+            remaining = numbered_re.sub("", text)
+            if unnumbered_re.search(remaining):
+                has_unnumbered = True
+
+        if not has_unnumbered:
+            continue
+
+        # 임시 번호 부여 (max + 1부터)
+        counter = [max_n]
+        for para_el in paragraphs:
+            original = get_para_texts(para_el)
+
+            def replacer(m):
+                counter[0] += 1
+                return m.group(0).replace("제호증", f"제{counter[0]}호증")
+
+            replaced = unnumbered_re.sub(replacer, original)
+            if replaced != original:
+                set_para_texts(para_el, replaced)
+
+        assigned = counter[0] - max_n
+        print(f"[자동] 번호 없는 {label} {assigned}개에 임시 번호 부여 (제{max_n + 1}~제{counter[0]}호증)")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -170,28 +217,28 @@ MODE_CONFIGS = {
         "pattern": EXHIBIT_A_RE,
         "list_start": EXHIBIT_A_LIST_RE,
         "format_name": lambda n: f"갑 제{n}호증",
-        "format_line": lambda n, name: f"갑 제{n}호증  {name}",
+        "format_line": lambda n, name: f"갑 제{n}호증 {name}",
     },
     "exhibit_b": {
         "label": "을호증",
         "pattern": EXHIBIT_B_RE,
         "list_start": EXHIBIT_B_LIST_RE,
         "format_name": lambda n: f"을 제{n}호증",
-        "format_line": lambda n, name: f"을 제{n}호증  {name}",
+        "format_line": lambda n, name: f"을 제{n}호증 {name}",
     },
     "exhibit_b_nonum": {
         "label": "을호증 (번호 미기재)",
         "pattern": EXHIBIT_B_NONUM_RE,  # 번호 없는 패턴
         "list_start": EXHIBIT_B_LIST_RE,  # 입증방법 목록에는 번호가 있을 수 있음
         "format_name": lambda n: f"을 제{n}호증",
-        "format_line": lambda n, name: f"을 제{n}호증  {name}",
+        "format_line": lambda n, name: f"을 제{n}호증 {name}",
     },
     "reference": {
         "label": "참고자료",
         "pattern": REFERENCE_RE,
         "list_start": REFERENCE_LIST_RE,
         "format_name": lambda n: f"참고자료 {n}",
-        "format_line": lambda n, name: f"참고자료 {n}  {name}",
+        "format_line": lambda n, name: f"참고자료 {n} {name}",
     },
 }
 
@@ -209,23 +256,81 @@ def replace_numbers(text, mapping, pattern):
     return pattern.sub(replacer, text)
 
 
+def _is_citation_line(text, match):
+    """증거 인용 줄인지 판별 (본문 문장 속 언급과 구분).
+
+    인용 줄: 줄 시작이 비어있거나 대시/불릿 뒤에 바로 증거번호가 오는 형태
+      예) "- 갑 제8호증 녹취록"  /  "갑 제3호증 매매계약서"
+    본문:  앞에 한글 텍스트가 있는 형태
+      예) "또한 다음 갑 제8호증 녹취록의 내용을 보면, ..."
+    """
+    before = text[:match.start()].strip()
+    # 대시·불릿·공백만 남으면 인용 줄
+    before_clean = re.sub(r'^[-·•\-\s\d.]+$', '', before)
+    return len(before_clean) == 0
+
+
 def build_registry(paragraphs, pattern):
-    """본문에서 증거 최초 등장 순서 기록. 반환: (order, registry)"""
-    registry = {}
+    """본문에서 증거 최초 등장 순서 기록. 반환: (order, registry)
+
+    이름은 '인용 줄'(- 갑 제N호증 이름)에서 우선적으로 가져오고,
+    본문 문장 속 언급("갑 제N호증 녹취록의 내용을 보면, ...")은 이름으로 채택하지 않는다.
+    """
+    registry = {}          # { n: name }
+    registry_is_cite = {}  # { n: True/False } — 인용 줄에서 가져온 이름인지
     order = []
 
     for para_el in paragraphs:
         text = get_para_texts(para_el)
         for m in pattern.finditer(text):
             n = int(m.group(1))
+            is_cite = _is_citation_line(text, m)
+            name_after = text[m.end():].strip()
+            name_after = re.sub(r"^[\.\s]+", "", name_after)
+
             if n not in registry:
-                name_after = text[m.end():].strip()
-                name_after = re.sub(r"^[\.\s]+", "", name_after)
-                name_after = re.sub(r"^\d+\.\s*", "", name_after)
+                # 첫 등장: 순서 기록 + 이름 임시 저장
                 registry[n] = name_after
+                registry_is_cite[n] = is_cite
                 order.append(n)
+            elif is_cite and not registry_is_cite.get(n, False):
+                # 이전에 본문 문장에서 가져온 이름 → 인용 줄 이름으로 교체
+                registry[n] = name_after
+                registry_is_cite[n] = True
 
     return order, registry
+
+
+def deduplicate_registry(order, registry, cfg):
+    """같은 이름의 증거를 하나로 병합.
+
+    예) 갑 제3호증 '공급계약서', 갑 제6호증 '공급계약서'
+        → 갑 제6호증을 갑 제3호증으로 통합, order에서 제거
+    반환: (new_order, new_registry, merge_map)
+      merge_map: { 6: 3 } — 나중 번호 → 먼저 등장한 번호
+    """
+    name_to_first = {}   # { name: first_old_n }
+    merge_map = {}       # { later_n: first_n }
+    new_order = []
+
+    for old_n in order:
+        name = registry.get(old_n, "").strip()
+        if not name:
+            new_order.append(old_n)
+            continue
+
+        if name in name_to_first:
+            first_n = name_to_first[name]
+            merge_map[old_n] = first_n
+            print(f"[병합] {cfg['format_name'](old_n)} → {cfg['format_name'](first_n)}  (동일 증거: {name[:40]})")
+        else:
+            name_to_first[name] = old_n
+            new_order.append(old_n)
+
+    # 병합된 번호는 registry에서 제거
+    new_registry = {n: v for n, v in registry.items() if n not in merge_map}
+
+    return new_order, new_registry, merge_map
 
 
 def collect_list_items(paragraphs, section_idx, header_root, pattern):
@@ -322,7 +427,14 @@ def process_numbered(root, paragraphs, header_root, cfg):
                 registry[old_n] = name
                 order.append(old_n)
 
+    # 동일 이름 증거 병합 (갑 제3호증, 갑 제6호증 둘 다 '공급계약서' → 하나로)
+    order, registry, merge_map = deduplicate_registry(order, registry, cfg)
+
     mapping = build_mapping(order)
+
+    # merge_map의 나중 번호도 mapping에 반영 (6→3의 새 번호로)
+    for later_n, first_n in merge_map.items():
+        mapping[later_n] = mapping[first_n]
 
     print("=" * 60)
     print(f"[확인] {cfg['label']} 번호 재매핑")
@@ -330,16 +442,20 @@ def process_numbered(root, paragraphs, header_root, cfg):
     for old_n in order:
         new_n = mapping[old_n]
         print(f"  {cfg['format_name'](old_n)} → {cfg['format_name'](new_n)}  ({registry[old_n][:40]})")
+    if merge_map:
+        print("-" * 60)
+        for later_n, first_n in merge_map.items():
+            print(f"  {cfg['format_name'](later_n)} → {cfg['format_name'](mapping[later_n])}  (동일 증거 병합)")
     print("=" * 60)
 
-    # 본문 치환
+    # 본문 치환 (병합 포함)
     for para_el in body_paragraphs:
         original = get_para_texts(para_el)
         replaced = replace_numbers(original, mapping, pattern)
         if replaced != original:
             set_para_texts(para_el, replaced)
 
-    # 마무리 목록 재생성
+    # 마무리 목록 재생성 (병합으로 줄어든 order 기준)
     if section_idx is not None and list_items:
         _regenerate_list(root, list_items, order, registry, cfg)
 
@@ -427,10 +543,14 @@ def _find_section_idx_nonum(paragraphs):
 # ═══════════════════════════════════════════════════════════════
 def _regenerate_list(root, list_items, order, registry, cfg):
     """마무리 목록 단락을 삭제하고 새 목록으로 교체."""
-    auto_tmpl = next(
-        (p for p, is_auto, _, _ in list_items if is_auto),
-        list_items[0][0]
-    )
+    # 자동번호 스타일 템플릿 우선 선택, 없으면 첫 항목 사용
+    tmpl_is_auto = False
+    auto_tmpl = list_items[0][0]
+    for p, is_auto, _, _ in list_items:
+        if is_auto:
+            auto_tmpl = p
+            tmpl_is_auto = True
+            break
 
     root_children = list(root)
     first_para = list_items[0][0]
@@ -441,7 +561,11 @@ def _regenerate_list(root, list_items, order, registry, cfg):
     new_lines = []
     for new_n, old_n in enumerate(order, start=1):
         name = registry[old_n]
-        new_lines.append(cfg["format_line"](new_n, name))
+        line = cfg["format_line"](new_n, name)
+        # 자동번호 스타일이 아니면 "1. ", "2. " 순번을 텍스트에 직접 추가
+        if not tmpl_is_auto:
+            line = f"{new_n}. {line}"
+        new_lines.append(line)
 
     for i in range(end_pos, start_pos - 1, -1):
         root.remove(root_children[i])
@@ -451,6 +575,250 @@ def _regenerate_list(root, list_items, order, registry, cfg):
         root.insert(start_pos, new_para)
 
     print(f"\n[완료] 마무리 목록 재생성 완료 ({len(new_lines)}개 항목)")
+
+
+# ═══════════════════════════════════════════════════════════════
+# 증거 파일 이름 변경
+# ═══════════════════════════════════════════════════════════════
+def extract_evidence_names(hwpx_path):
+    """처리된 HWPX 파일에서 최종 증거 번호-이름 매핑을 추출."""
+    with zipfile.ZipFile(hwpx_path, "r") as z:
+        xml_bytes = z.read("Contents/section0.xml")
+        header_bytes = z.read("Contents/header.xml")
+
+    root = ET.fromstring(xml_bytes)
+    header_root = ET.fromstring(header_bytes)
+    paragraphs = root.findall(f"{{{HP}}}p")
+
+    mode = detect_mode(paragraphs)
+    cfg = MODE_CONFIGS[mode]
+    # 출력 파일에서는 을호증에 이미 번호가 부여되었으므로 exhibit_b로 처리
+    if mode == "exhibit_b_nonum":
+        mode = "exhibit_b"
+        cfg = MODE_CONFIGS[mode]
+    pattern = cfg["pattern"]
+    list_start = cfg["list_start"]
+
+    section_idx = find_section_idx(paragraphs, list_start)
+    evidence = {}
+
+    # 입증방법 섹션에서 이름 추출 (가장 깔끔한 소스)
+    if section_idx is not None:
+        list_items = collect_list_items(paragraphs, section_idx, header_root, pattern)
+        for _, _, n, name in list_items:
+            if name.strip():
+                evidence[n] = name.strip()
+
+    # 입증방법에서 못 찾으면 본문에서 추출
+    if not evidence:
+        body = paragraphs[:section_idx] if section_idx else paragraphs
+        _, reg = build_registry(body, pattern)
+        evidence = {n: name.strip() for n, name in reg.items() if name.strip()}
+
+    return evidence, cfg
+
+
+def _normalize_name(s):
+    """증거 이름 비교용 정규화: 선행 0 제거, 공백·구두점 통일."""
+    s = re.sub(r"\.\s*0+(\d)", r". \1", s)   # ". 04." → ". 4."
+    s = re.sub(r"\b0+(\d)", r"\1", s)         # "02.53" → "2.53"
+    s = re.sub(r"\s+", " ", s).strip()        # 연속 공백 → 단일 공백
+    return s
+
+
+def _core_name(s):
+    """증거 이름에서 핵심 키워드만 추출 (공백·특수문자·시간표기 차이 무시)."""
+    s = _normalize_name(s)
+    s = re.sub(r"[()（）\[\]~～:：.,\s]", "", s)  # 구두점·공백 모두 제거
+    return s
+
+
+def _strip_exhibit_prefix(fname_no_ext):
+    """파일명에서 증거 접두사(갑 제N호증 등)를 제거하고 (clean, old_n)을 반환."""
+    m = re.match(r"^(갑|을)\s*제(\d+)호증\s*", fname_no_ext)
+    if m:
+        old_n = int(m.group(2))
+        clean = fname_no_ext[m.end():].strip()
+        return clean, old_n
+
+    m2 = re.match(r"^참고자료\s*(\d+)\s*\.?\s*", fname_no_ext)
+    if m2:
+        old_n = int(m2.group(1))
+        clean = fname_no_ext[m2.end():].strip()
+        return clean, old_n
+
+    return fname_no_ext.strip(), None
+
+
+def _safe_startswith(longer, shorter):
+    """shorter로 시작하되, 바로 뒤에 숫자가 오면 False.
+
+    '카카오톡 내역'.startswith('카카오톡 내역') → True
+    '카카오톡 내역1'.startswith('카카오톡 내역') → False (뒤에 '1'이 바로 이어짐)
+    '카카오톡 내역 추가분'.startswith('카카오톡 내역') → True (공백 분리)
+    """
+    if not longer.startswith(shorter):
+        return False
+    remainder = longer[len(shorter):]
+    if not remainder:
+        return True  # 완전 일치
+    # 나머지가 숫자로 시작하면 다른 자료 (카카오톡 내역1 ≠ 카카오톡 내역)
+    if remainder[0].isdigit():
+        return False
+    return True
+
+
+def _names_match(file_clean, ev_name):
+    """파일 이름과 증거 이름이 일치하는지 정규화 비교."""
+    fc = _normalize_name(file_clean)
+    en = _normalize_name(ev_name)
+    if not fc or len(fc) < 2:
+        return False
+    # 정확 일치
+    if fc == en:
+        return True
+    # 한쪽이 다른 쪽으로 시작 (숫자 접미사 보호)
+    if _safe_startswith(en, fc) or _safe_startswith(fc, en):
+        return True
+    # 핵심 키워드 비교 (공백·괄호·콜론 등 차이 무시)
+    fc_core = _core_name(file_clean)
+    en_core = _core_name(ev_name)
+    if fc_core and en_core and (fc_core == en_core
+                                 or _safe_startswith(en_core, fc_core)
+                                 or _safe_startswith(fc_core, en_core)):
+        return True
+    return False
+
+
+def rename_evidence_files(input_hwpx, output_hwpx):
+    """같은 폴더의 증거 파일명에 증거 번호를 자동 부여."""
+    evidence, cfg = extract_evidence_names(output_hwpx)
+    if not evidence:
+        return
+
+    # 원본에서도 증거 이름 추출 (번호 매핑용)
+    old_evidence, _ = extract_evidence_names(input_hwpx)
+
+    folder = os.path.dirname(os.path.abspath(input_hwpx))
+    exclude = {os.path.basename(input_hwpx), os.path.basename(output_hwpx)}
+
+    # 자료 폴더 경로 (재실행 시 여기서도 파일 탐색)
+    input_basename = os.path.splitext(os.path.basename(input_hwpx))[0]
+    data_folder = os.path.join(folder, f"{input_basename}_자료")
+
+    # 후보 파일 수집 (입력/출력 hwpx, .py 제외)
+    # 루트 폴더 + 기존 자료 폴더 모두 탐색
+    candidates = []       # (파일명, 원본경로) 쌍
+    for f in os.listdir(folder):
+        full = os.path.join(folder, f)
+        if not os.path.isfile(full):
+            continue
+        if f in exclude or f.endswith('.py'):
+            continue
+        candidates.append((f, full))
+
+    # 자료 폴더가 이미 있으면 그 안의 파일도 포함
+    if os.path.isdir(data_folder):
+        for f in os.listdir(data_folder):
+            full = os.path.join(data_folder, f)
+            if not os.path.isfile(full):
+                continue
+            if f.endswith('.py'):
+                continue
+            candidates.append((f, full))
+
+    if not candidates:
+        return
+
+    # 원본 번호 → 신규 번호 매핑 (이름 기준 대조)
+    old_to_new = {}
+    for old_n, old_name in old_evidence.items():
+        for new_n, new_name in evidence.items():
+            if _names_match(old_name, new_name):
+                old_to_new[old_n] = new_n
+                break
+
+    # ── 1차: 이름 기반 매칭 (서면 증거 이름으로 파일명 통일) ──
+    renames = []          # [(원본경로, 새파일명)]
+    used_paths = set()
+    used_evidence = set()
+
+    for n in sorted(evidence.keys()):
+        ev_name = evidence[n]
+        prefix = cfg["format_name"](n)
+
+        for fname, fpath in candidates:
+            if fpath in used_paths:
+                continue
+            fname_no_ext = os.path.splitext(fname)[0]
+            ext = os.path.splitext(fname)[1]
+            clean, _ = _strip_exhibit_prefix(fname_no_ext)
+
+            if clean and _names_match(clean, ev_name):
+                new_name = f"{prefix} {ev_name}{ext}"
+                renames.append((fpath, new_name))
+                used_paths.add(fpath)
+                used_evidence.add(n)
+                break
+
+    # ── 2차: 번호 기반 매칭 (1차에서 매칭 안 된 파일) ──
+    for fname, fpath in candidates:
+        if fpath in used_paths:
+            continue
+        fname_no_ext = os.path.splitext(fname)[0]
+        ext = os.path.splitext(fname)[1]
+        clean, file_old_n = _strip_exhibit_prefix(fname_no_ext)
+
+        if file_old_n is None or not clean:
+            continue
+
+        new_n = old_to_new.get(file_old_n)
+        if new_n and new_n not in used_evidence:
+            prefix = cfg["format_name"](new_n)
+            ev_name = evidence.get(new_n, clean)
+            new_name = f"{prefix} {ev_name}{ext}"
+            renames.append((fpath, new_name))
+            used_paths.add(fpath)
+            used_evidence.add(new_n)
+
+    if not renames:
+        print("\n[참고] 증거 번호를 붙일 파일을 찾지 못했습니다.")
+        return
+
+    # 자료 폴더 생성: {서면이름}_자료
+    data_folder_name = f"{input_basename}_자료"
+    os.makedirs(data_folder, exist_ok=True)
+
+    print(f"\n{'=' * 60}")
+    print(f"[증거 파일 → {data_folder_name} 폴더]")
+    print(f"{'-' * 60}")
+    for old_path, new_name in renames:
+        old_display = os.path.basename(old_path)
+        # 이미 자료 폴더 안에 있는 파일은 경로 표시 생략
+        if os.path.dirname(old_path) == data_folder:
+            old_display = f"{data_folder_name}/{old_display}"
+        print(f"  {old_display}")
+        print(f"    → {data_folder_name}/{new_name}")
+    print(f"{'=' * 60}")
+
+    # 2단계 이동+이름 변경 (충돌 방지: 먼저 임시 이름 → 최종 이름)
+    # 1단계: 모든 파일을 자료 폴더 내 임시 이름으로 이동
+    temp_renames = []
+    for src_path, new_name in renames:
+        temp_name = f"__exhibit_temp__{os.path.basename(src_path)}"
+        temp_path = os.path.join(data_folder, temp_name)
+        shutil.move(src_path, temp_path)
+        temp_renames.append((temp_name, new_name))
+
+    # 2단계: 임시 이름을 최종 이름으로 변경
+    renamed_count = 0
+    for temp_name, new_name in temp_renames:
+        temp_path = os.path.join(data_folder, temp_name)
+        new_path = os.path.join(data_folder, new_name)
+        os.rename(temp_path, new_path)
+        renamed_count += 1
+
+    print(f"\n[완료] {renamed_count}개 증거 파일을 {data_folder_name} 폴더로 이동 완료")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -466,6 +834,9 @@ def renumber_hwpx(input_path, output_path):
     header_root = ET.fromstring(header_bytes)
     root = ET.fromstring(xml_bytes)
     paragraphs = root.findall(f"{{{HP}}}p")
+
+    # 전처리: 번호 없는 증거(갑 제호증, 을 제호증)에 임시 번호 부여
+    preprocess_all_unnumbered(paragraphs)
 
     mode = detect_mode(paragraphs)
     cfg = MODE_CONFIGS[mode]
@@ -493,6 +864,9 @@ def renumber_hwpx(input_path, output_path):
     os.replace(tmp_path, output_path)
     print(f"\n[저장] 저장 완료: {output_path}")
 
+    # 같은 폴더의 증거 파일명에 증거 번호 자동 부여
+    rename_evidence_files(input_path, output_path)
+
 
 def preview_only(input_path):
     """HWPX를 수정하지 않고 재매핑 결과만 출력."""
@@ -503,6 +877,9 @@ def preview_only(input_path):
     root = ET.fromstring(xml_bytes)
     header_root = ET.fromstring(header_bytes)
     paragraphs = root.findall(f"{{{HP}}}p")
+
+    # 전처리: 번호 없는 증거에 임시 번호 부여 (미리보기용, 원본 미변경)
+    preprocess_all_unnumbered(paragraphs)
 
     mode = detect_mode(paragraphs)
     cfg = MODE_CONFIGS[mode]
@@ -534,7 +911,12 @@ def _preview_numbered(paragraphs, header_root, cfg):
                 registry[old_n] = name
                 order.append(old_n)
 
+    # 동일 이름 증거 병합
+    order, registry, merge_map = deduplicate_registry(order, registry, cfg)
+
     mapping = build_mapping(order)
+    for later_n, first_n in merge_map.items():
+        mapping[later_n] = mapping[first_n]
 
     print("=" * 60)
     print(f"[미리보기] {cfg['label']} 번호 재매핑 결과")
@@ -543,6 +925,10 @@ def _preview_numbered(paragraphs, header_root, cfg):
         new_n = mapping[old_n]
         arrow = "→" if old_n != new_n else "="
         print(f"  {cfg['format_name'](old_n)} {arrow} {cfg['format_name'](new_n)}  {registry[old_n][:50]}")
+    if merge_map:
+        print("-" * 60)
+        for later_n, first_n in merge_map.items():
+            print(f"  {cfg['format_name'](later_n)} → {cfg['format_name'](mapping[later_n])}  (동일 증거 병합)")
     print("-" * 60)
     print(f"\n[확인] 재생성될 마무리 목록:")
     for new_n, old_n in enumerate(order, start=1):
