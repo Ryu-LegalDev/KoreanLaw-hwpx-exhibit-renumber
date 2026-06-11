@@ -218,6 +218,8 @@ MODE_CONFIGS = {
         "list_start": EXHIBIT_A_LIST_RE,
         "format_name": lambda n: f"갑 제{n}호증",
         "format_line": lambda n, name: f"갑 제{n}호증 {name}",
+        "needs_seq_prefix": True,   # 입증방법에 "1. 갑 제1호증 ..."
+        "folder_suffix": "_입증방법",
     },
     "exhibit_b": {
         "label": "을호증",
@@ -225,20 +227,26 @@ MODE_CONFIGS = {
         "list_start": EXHIBIT_B_LIST_RE,
         "format_name": lambda n: f"을 제{n}호증",
         "format_line": lambda n, name: f"을 제{n}호증 {name}",
+        "needs_seq_prefix": True,   # 입증방법에 "1. 을 제1호증 ..."
+        "folder_suffix": "_입증방법",
     },
     "exhibit_b_nonum": {
         "label": "을호증 (번호 미기재)",
-        "pattern": EXHIBIT_B_NONUM_RE,  # 번호 없는 패턴
-        "list_start": EXHIBIT_B_LIST_RE,  # 입증방법 목록에는 번호가 있을 수 있음
+        "pattern": EXHIBIT_B_NONUM_RE,
+        "list_start": EXHIBIT_B_LIST_RE,
         "format_name": lambda n: f"을 제{n}호증",
         "format_line": lambda n, name: f"을 제{n}호증 {name}",
+        "needs_seq_prefix": True,
+        "folder_suffix": "_입증방법",
     },
     "reference": {
         "label": "참고자료",
         "pattern": REFERENCE_RE,
         "list_start": REFERENCE_LIST_RE,
         "format_name": lambda n: f"참고자료 {n}",
-        "format_line": lambda n, name: f"참고자료 {n} {name}",
+        "format_line": lambda n, name: f"참고자료 {n}. {name}",
+        "needs_seq_prefix": False,  # "참고자료 1. 이름"에 이미 번호 포함
+        "folder_suffix": "_참고자료",
     },
 }
 
@@ -423,6 +431,10 @@ def process_numbered(root, paragraphs, header_root, cfg):
         list_items = collect_list_items(paragraphs, section_idx, header_root, pattern)
         for _, _, old_n, name in list_items:
             if old_n not in registry:
+                if not name.strip():
+                    # 이름 없는 입증방법 항목은 자리표시자이므로 무시
+                    # (예: "갑 제1호증" 만 적혀있고 증거 이름이 없는 경우)
+                    continue
                 print(f"[경고] {cfg['format_name'](old_n)}이(가) 마무리 목록에는 있으나, 실제 본문에는 없습니다. ({name[:40]})")
                 registry[old_n] = name
                 order.append(old_n)
@@ -562,8 +574,9 @@ def _regenerate_list(root, list_items, order, registry, cfg):
     for new_n, old_n in enumerate(order, start=1):
         name = registry[old_n]
         line = cfg["format_line"](new_n, name)
-        # 자동번호 스타일이 아니면 "1. ", "2. " 순번을 텍스트에 직접 추가
-        if not tmpl_is_auto:
+        # 자동번호 스타일이 아니고 순번 접두사가 필요한 모드만 "1. " 추가
+        # (참고자료는 "참고자료 1. 이름"에 이미 번호가 포함되므로 제외)
+        if not tmpl_is_auto and cfg.get("needs_seq_prefix", True):
             line = f"{new_n}. {line}"
         new_lines.append(line)
 
@@ -702,9 +715,12 @@ def rename_evidence_files(input_hwpx, output_hwpx):
     folder = os.path.dirname(os.path.abspath(input_hwpx))
     exclude = {os.path.basename(input_hwpx), os.path.basename(output_hwpx)}
 
-    # 자료 폴더 경로 (재실행 시 여기서도 파일 탐색)
+    # 자료 폴더 경로 (문서 유형에 따라 접미사 결정)
     input_basename = os.path.splitext(os.path.basename(input_hwpx))[0]
-    data_folder = os.path.join(folder, f"{input_basename}_자료")
+    folder_suffix = cfg.get("folder_suffix", "_입증방법")
+    data_folder = os.path.join(folder, f"{input_basename}{folder_suffix}")
+    # 이전 버전 호환: _자료 폴더도 탐색 대상에 포함
+    legacy_folder = os.path.join(folder, f"{input_basename}_자료")
 
     # 후보 파일 수집 (입력/출력 hwpx, .py 제외)
     # 루트 폴더 + 기존 자료 폴더 모두 탐색
@@ -717,15 +733,18 @@ def rename_evidence_files(input_hwpx, output_hwpx):
             continue
         candidates.append((f, full))
 
-    # 자료 폴더가 이미 있으면 그 안의 파일도 포함
-    if os.path.isdir(data_folder):
-        for f in os.listdir(data_folder):
-            full = os.path.join(data_folder, f)
+    # 자료 폴더가 이미 있으면 그 안의 파일도 포함 (현재 접미사 + 이전 _자료)
+    for search_folder in [data_folder, legacy_folder]:
+        if not os.path.isdir(search_folder):
+            continue
+        for f in os.listdir(search_folder):
+            full = os.path.join(search_folder, f)
             if not os.path.isfile(full):
                 continue
             if f.endswith('.py'):
                 continue
-            candidates.append((f, full))
+            if full not in {fp for _, fp in candidates}:
+                candidates.append((f, full))
 
     if not candidates:
         return
@@ -785,8 +804,8 @@ def rename_evidence_files(input_hwpx, output_hwpx):
         print("\n[참고] 증거 번호를 붙일 파일을 찾지 못했습니다.")
         return
 
-    # 자료 폴더 생성: {서면이름}_자료
-    data_folder_name = f"{input_basename}_자료"
+    # 자료 폴더 생성: {서면이름}_{입증방법|참고자료}
+    data_folder_name = f"{input_basename}{folder_suffix}"
     os.makedirs(data_folder, exist_ok=True)
 
     print(f"\n{'=' * 60}")
@@ -794,9 +813,10 @@ def rename_evidence_files(input_hwpx, output_hwpx):
     print(f"{'-' * 60}")
     for old_path, new_name in renames:
         old_display = os.path.basename(old_path)
-        # 이미 자료 폴더 안에 있는 파일은 경로 표시 생략
-        if os.path.dirname(old_path) == data_folder:
-            old_display = f"{data_folder_name}/{old_display}"
+        # 이미 자료 폴더 안에 있는 파일은 경로 표시
+        src_dir = os.path.dirname(old_path)
+        if src_dir in (data_folder, legacy_folder):
+            old_display = f"{os.path.basename(src_dir)}/{old_display}"
         print(f"  {old_display}")
         print(f"    → {data_folder_name}/{new_name}")
     print(f"{'=' * 60}")
@@ -907,6 +927,8 @@ def _preview_numbered(paragraphs, header_root, cfg):
         list_items = collect_list_items(paragraphs, section_idx, header_root, pattern)
         for _, _, old_n, name in list_items:
             if old_n not in registry:
+                if not name.strip():
+                    continue
                 print(f"[경고] {cfg['format_name'](old_n)}이(가) 마무리 목록에는 있으나, 실제 본문에는 없습니다. ({name[:40]})")
                 registry[old_n] = name
                 order.append(old_n)
@@ -932,7 +954,10 @@ def _preview_numbered(paragraphs, header_root, cfg):
     print("-" * 60)
     print(f"\n[확인] 재생성될 마무리 목록:")
     for new_n, old_n in enumerate(order, start=1):
-        print(f"  {new_n}. {cfg['format_line'](new_n, registry[old_n])}")
+        line = cfg['format_line'](new_n, registry[old_n])
+        if cfg.get("needs_seq_prefix", True):
+            line = f"{new_n}. {line}"
+        print(f"  {line}")
     print("=" * 60)
 
 
@@ -958,7 +983,10 @@ def _preview_nonum(paragraphs, header_root, cfg):
     print("-" * 60)
     print(f"\n[확인] 재생성될 마무리 목록:")
     for new_n, old_n in enumerate(order, start=1):
-        print(f"  {new_n}. {cfg['format_line'](new_n, registry[old_n])}")
+        line = cfg['format_line'](new_n, registry[old_n])
+        if cfg.get("needs_seq_prefix", True):
+            line = f"{new_n}. {line}"
+        print(f"  {line}")
     print("=" * 60)
 
 
