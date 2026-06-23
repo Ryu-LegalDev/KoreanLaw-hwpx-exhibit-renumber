@@ -453,6 +453,7 @@ MODE_CONFIGS = {
         "format_name": lambda n: _fmt_exhibit("갑", n),
         "format_line": lambda n, name: f"{_fmt_exhibit('갑', n)} {name}",
         "needs_seq_prefix": True,
+        "seq_fixed": True,
         "folder_suffix": "_입증방법",
     },
     "exhibit_b": {
@@ -462,6 +463,7 @@ MODE_CONFIGS = {
         "format_name": lambda n: _fmt_exhibit("을", n),
         "format_line": lambda n, name: f"{_fmt_exhibit('을', n)} {name}",
         "needs_seq_prefix": True,
+        "seq_fixed": True,
         "folder_suffix": "_입증방법",
     },
     "exhibit_b_nonum": {
@@ -471,6 +473,7 @@ MODE_CONFIGS = {
         "format_name": lambda n: _fmt_exhibit("을", n),
         "format_line": lambda n, name: f"{_fmt_exhibit('을', n)} {name}",
         "needs_seq_prefix": True,
+        "seq_fixed": True,
         "folder_suffix": "_입증방법",
     },
     "exhibit_sa": {
@@ -480,6 +483,7 @@ MODE_CONFIGS = {
         "format_name": lambda n: _fmt_exhibit("소갑", n),
         "format_line": lambda n, name: f"{_fmt_exhibit('소갑', n)} {name}",
         "needs_seq_prefix": True,
+        "seq_fixed": True,
         "folder_suffix": "_소명방법",
     },
     "exhibit_sa_nonum": {
@@ -489,6 +493,7 @@ MODE_CONFIGS = {
         "format_name": lambda n: _fmt_exhibit("소갑", n),
         "format_line": lambda n, name: f"{_fmt_exhibit('소갑', n)} {name}",
         "needs_seq_prefix": True,
+        "seq_fixed": True,
         "folder_suffix": "_소명방법",
     },
     "reference": {
@@ -498,6 +503,7 @@ MODE_CONFIGS = {
         "format_name": lambda n: f"참고자료 {n}.",
         "format_line": lambda n, name: f"{name}",
         "needs_seq_prefix": True,
+        "seq_fixed": False,
         "folder_suffix": "_참고자료",
     },
 }
@@ -844,24 +850,28 @@ def _regenerate_list(root, list_items, groups, registry, cfg):
     end_pos = root_children.index(last_para)
 
     new_lines = []
+    seq = 0
     main_n = 0
+    use_fixed = cfg.get("seq_fixed", True)
     for group in groups:
         main_n += 1
         if len(group) == 1:
+            seq += 1
             old_key = group[0]
             name = registry[old_key]
             label = str(main_n)
             line = cfg["format_line"](label, name)
             if not tmpl_is_auto and cfg.get("needs_seq_prefix", True):
-                line = f"1. {line}"
+                line = f"{'1' if use_fixed else seq}. {line}"
             new_lines.append(line)
         else:
             for sub_n, old_key in enumerate(group, start=1):
+                seq += 1
                 name = registry[old_key]
                 label = f"{main_n}-{sub_n}"
                 line = cfg["format_line"](label, name)
                 if not tmpl_is_auto and cfg.get("needs_seq_prefix", True):
-                    line = f"1. {line}"
+                    line = f"{'1' if use_fixed else seq}. {line}"
                 new_lines.append(line)
 
     for i in range(end_pos, start_pos - 1, -1):
@@ -1300,14 +1310,17 @@ def _preview_numbered(paragraphs, header_root, cfg):
             print(f"  {cfg['format_name'](later_n)} → {cfg['format_name'](mapping[later_n])}  (동일 증거 병합)")
     print("-" * 60)
     print(f"\n[확인] 재생성될 마무리 목록:")
+    seq = 0
     main_n = 0
+    use_fixed = cfg.get("seq_fixed", True)
     for group in groups:
         main_n += 1
         for sub_idx, old_key in enumerate(group):
+            seq += 1
             label = str(main_n) if len(group) == 1 else f"{main_n}-{sub_idx + 1}"
             line = cfg['format_line'](label, registry[old_key])
             if cfg.get("needs_seq_prefix", True):
-                line = f"1. {line}"
+                line = f"{'1' if use_fixed else seq}. {line}"
             print(f"  {line}")
     print("=" * 60)
 
