@@ -72,6 +72,11 @@ EXHIBIT_B_NONUM_RE = re.compile(r"을\s*제호증")
 # 소갑호증 (번호 없음) — "소갑 제호증"
 EXHIBIT_SA_NONUM_RE = re.compile(r"소갑\s*제호증")
 
+# 참고자료
+REFERENCE_RE = re.compile(r"참고자료\s*(\d{1,3})(?!\d)")
+REFERENCE_NONUM_RE = re.compile(r"참고자료\s+(?!목록)\S")
+REFERENCE_LIST_RE = re.compile(r"^(?:\d+[\.\s]+)?참고자료\s*\d+|^\d+(?:-\d+)?\.\s+\S")
+
 # 하위번호 패턴 (평탄화용) — 구형식(제N-M호증)과 신형식(제N호증의 M) 모두 지원
 _EXHIBIT_SUB_PATTERNS = [
     # (구형식 RE, 신형식 RE, main_RE, label)
@@ -84,6 +89,9 @@ _EXHIBIT_SUB_PATTERNS = [
     (re.compile(r"(소갑\s*제)\d+-\d+(호증)"),
      re.compile(r"(소갑\s*제)\d+(호증)의\s*\d+"),
      EXHIBIT_SA_RE, "소갑"),
+    (re.compile(r"(참고자료\s*)\d+-\d+()"),
+     re.compile(r"(참고자료\s*)\d+()의\s*\d+"),
+     REFERENCE_RE, "참고자료"),
 ]
 
 # 라벨 캡처 패턴 (출력 파일 읽기용)
@@ -96,13 +104,10 @@ _EXHIBIT_SA_LABELED_RE = re.compile(r"소갑\s*제(\d+)(?:-(\d+))?호증(?:의\s
 def _labeled_match_to_label(m):
     """라벨 캡처 패턴의 match에서 내부 라벨 문자열 추출."""
     main = m.group(1)
+    if m.lastindex < 2:
+        return main
     sub = m.group(2) or (m.group(3) if m.lastindex >= 3 else None)
     return f"{main}-{sub}" if sub else main
-
-# 참고자료
-REFERENCE_RE = re.compile(r"참고자료\s*(\d+)")
-REFERENCE_NONUM_RE = re.compile(r"참고자료\s+(?!\d)(?!목록)\S")
-REFERENCE_LIST_RE = re.compile(r"^(?:\d+[\.\s]+)?참고자료\s*\d+|^\d+\.\s+\S")
 
 # 마무리 섹션 헤더 키워드 (공백 제거 후 비교)
 SECTION_KEYWORDS = {"입증방법", "소명방법", "참고자료", "첨부서류", "첨부자료", "참고자료목록"}
@@ -112,7 +117,11 @@ SECTION_KEYWORDS = {"입증방법", "소명방법", "참고자료", "첨부서�
 # 전처리: 하위번호(제N-M호증) 평탄화
 # ═══════════════════════════════════════════════════════════════
 def _flatten_subnumbers(paragraphs):
-    """제N-M호증 / 제N호증의 M을 순차 번호로 변환."""
+    """제N-M호증 / 제N호증의 M을 순차 번호로 변환.
+    반환: {flattened_n: (original_main, original_sub)} — 원본 하위번호 구조 기록
+    """
+    sub_origin = {}
+
     for old_sub_re, new_sub_re, main_re, label in _EXHIBIT_SUB_PATTERNS:
         has_sub = False
         max_n = 0
@@ -127,21 +136,33 @@ def _flatten_subnumbers(paragraphs):
             continue
 
         counter = [max_n]
-        for para_el in paragraphs:
-            text = get_para_texts(para_el)
 
+        def _make_repl(sub_type):
             def _repl(m, _counter=counter):
                 _counter[0] += 1
-                return m.group(1) + str(_counter[0]) + m.group(2)
+                new_n = _counter[0]
+                full = m.group(0)
+                if sub_type == 'old':
+                    nums = re.search(r'(\d+)-(\d+)', full)
+                else:
+                    nums = re.search(r'(\d+)\S*의\s*(\d+)', full)
+                if nums:
+                    sub_origin[new_n] = (int(nums.group(1)), int(nums.group(2)))
+                return m.group(1) + str(new_n) + m.group(2)
+            return _repl
 
-            text = old_sub_re.sub(_repl, text)
-            text = new_sub_re.sub(_repl, text)
+        for para_el in paragraphs:
+            text = get_para_texts(para_el)
+            text = old_sub_re.sub(_make_repl('old'), text)
+            text = new_sub_re.sub(_make_repl('new'), text)
             if text != get_para_texts(para_el):
                 set_para_texts(para_el, text)
 
         assigned = counter[0] - max_n
         if assigned > 0:
             print(f"[자동] {label} 하위번호 {assigned}개를 순차 번호로 변환")
+
+    return sub_origin
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -181,16 +202,42 @@ def group_evidence(order, registry):
     return groups
 
 
-def build_grouped_mapping(groups):
+def _group_by_original_main(order, sub_origin):
+    """원본 하위번호 구조를 기반으로 그룹핑."""
+    if not order:
+        return []
+    groups = []
+    current_main = None
+    current_group = []
+    for key in order:
+        if key in sub_origin:
+            orig_main = sub_origin[key][0]
+        else:
+            orig_main = None
+        if orig_main is not None and orig_main == current_main:
+            current_group.append(key)
+        else:
+            if current_group:
+                groups.append(current_group)
+            current_group = [key]
+            current_main = orig_main
+    if current_group:
+        groups.append(current_group)
+    return groups
+
+
+def build_grouped_mapping(groups, sub_origin=None, start_n=1):
     """그룹 정보를 바탕으로 old_key → 새 라벨 문자열 매핑 생성.
     단독 항목: "1", "2" / 그룹 항목: "1-1", "1-2"
-    반환: ({old_key: "label"}, groups_with_labels)
+    sub_origin이 있으면 원본 하위번호 항목은 단독이라도 "N-1" 형식 유지.
+    start_n: 시작 번호 (기본 1, 항소심 등에서는 이전 제출분 이후 번호).
     """
     mapping = {}
-    main_n = 0
+    main_n = start_n - 1
     for group in groups:
         main_n += 1
-        if len(group) == 1:
+        has_sub = sub_origin and any(k in sub_origin for k in group)
+        if len(group) == 1 and not has_sub:
             mapping[group[0]] = str(main_n)
         else:
             for sub_n, key in enumerate(group, start=1):
@@ -257,7 +304,7 @@ def preprocess_all_unnumbered(paragraphs):
 
     if has_ref_nonum:
         ref_counter = [max_ref]
-        _ref_nonum_re = re.compile(r"참고자료(\s+)(?!\d)(?!목록)")
+        _ref_nonum_re = re.compile(r"참고자료(\s+)(?!\d{1,3}(?:\.\s|\s|$))(?!목록)")
 
         for para_el in paragraphs:
             original = get_para_texts(para_el)
@@ -285,11 +332,15 @@ def preprocess_all_unnumbered(paragraphs):
 # 공통 유틸
 # ═══════════════════════════════════════════════════════════════
 def get_para_texts(para_el):
-    """단락 요소에서 <hp:t> 텍스트를 모두 이어붙여 반환."""
+    """단락 요소에서 <hp:t> 텍스트를 모두 이어붙여 반환.
+    <tab/> 등 자식 요소의 tail 텍스트도 포함."""
     parts = []
     for t in para_el.iter(f"{{{HP}}}t"):
         if t.text:
             parts.append(t.text)
+        for child in t:
+            if child.tail:
+                parts.append(child.tail)
     return "".join(parts)
 
 
@@ -370,6 +421,16 @@ def find_section_idx(paragraphs, list_start_re):
                 return i
             break
 
+    return None
+
+
+def _find_keyword_idx(paragraphs):
+    """마무리 섹션 키워드만으로 인덱스 반환 (목록 항목 유무 무관)."""
+    for i, para_el in enumerate(paragraphs):
+        text = get_para_texts(para_el)
+        cleaned = re.sub(r"\s", "", text.strip())
+        if cleaned in SECTION_KEYWORDS:
+            return i
     return None
 
 
@@ -550,6 +611,7 @@ def build_registry(paragraphs, pattern):
 
     이름은 '인용 줄'(- 갑 제N호증 이름)에서 우선적으로 가져오고,
     본문 문장 속 언급("갑 제N호증 녹취록의 내용을 보면, ...")은 이름으로 채택하지 않는다.
+    쉼표로 나열된 증거("갑 제1호증 A, 갑 제2호증 B")도 개별 이름 추출.
     """
     registry = {}          # { n: name }
     registry_is_cite = {}  # { n: True/False } — 인용 줄에서 가져온 이름인지
@@ -557,19 +619,25 @@ def build_registry(paragraphs, pattern):
 
     for para_el in paragraphs:
         text = get_para_texts(para_el)
-        for m in pattern.finditer(text):
+        matches = list(pattern.finditer(text))
+        multi_cite = len(matches) >= 2
+
+        for idx, m in enumerate(matches):
             n = int(m.group(1))
-            is_cite = _is_citation_line(text, m)
-            name_after = text[m.end():].strip()
+            is_cite = multi_cite or _is_citation_line(text, m)
+
+            if idx + 1 < len(matches):
+                name_after = text[m.end():matches[idx + 1].start()].strip()
+            else:
+                name_after = text[m.end():].strip()
             name_after = re.sub(r"^[\.\s]+", "", name_after)
+            name_after = name_after.rstrip(',').strip()
 
             if n not in registry:
-                # 첫 등장: 순서 기록 + 이름 임시 저장
                 registry[n] = name_after
                 registry_is_cite[n] = is_cite
                 order.append(n)
             elif is_cite and not registry_is_cite.get(n, False):
-                # 이전에 본문 문장에서 가져온 이름 → 인용 줄 이름으로 교체
                 registry[n] = name_after
                 registry_is_cite[n] = True
 
@@ -610,7 +678,7 @@ def deduplicate_registry(order, registry, cfg):
     return new_order, new_registry, merge_map
 
 
-_SIMPLE_LIST_RE = re.compile(r"^(\d{1,3})\.\s+(.+)")
+_SIMPLE_LIST_RE = re.compile(r"^(\d{1,3}(?:-\d+)?)\.\s+(.+)")
 
 def collect_list_items(paragraphs, section_idx, header_root, pattern):
     """마무리 목록 단락 수집."""
@@ -629,7 +697,7 @@ def collect_list_items(paragraphs, section_idx, header_root, pattern):
             m2 = _SIMPLE_LIST_RE.match(text)
             if not m2:
                 break
-            old_n = int(m2.group(1))
+            old_n = int(m2.group(1).split('-')[0])
             name = m2.group(2).strip()
         auto_num = is_auto_numbered_para(paragraphs[i], header_root)
         items.append((paragraphs[i], auto_num, old_n, name))
@@ -684,17 +752,23 @@ def collect_list_items_for_b(paragraphs, section_idx, header_root):
 # ═══════════════════════════════════════════════════════════════
 # 메인: 번호 있는 모드 (갑호증 / 을호증(번호) / 참고자료)
 # ═══════════════════════════════════════════════════════════════
-def process_numbered(root, paragraphs, header_root, cfg):
+def process_numbered(root, paragraphs, header_root, cfg, sub_origin=None):
     """번호가 있는 증거를 재번호매김."""
     pattern = cfg["pattern"]
     list_start = cfg["list_start"]
+    if sub_origin is None:
+        sub_origin = {}
 
     section_idx = find_section_idx(paragraphs, list_start)
+    keyword_only_idx = None
     if section_idx is None:
-        print(f"[경고] 마무리 섹션을 찾지 못했습니다. 본문 치환만 수행합니다.")
-        body_paragraphs = paragraphs
-    else:
-        body_paragraphs = paragraphs[:section_idx]
+        keyword_only_idx = _find_keyword_idx(paragraphs)
+        if keyword_only_idx is not None:
+            print(f"[참고] 마무리 섹션 키워드를 찾았으나 목록이 비어있습니다. 새로 생성합니다.")
+            section_idx = keyword_only_idx
+        else:
+            print(f"[경고] 마무리 섹션을 찾지 못했습니다. 본문 치환만 수행합니다.")
+    body_paragraphs = paragraphs[:section_idx] if section_idx is not None else paragraphs
 
     order, registry = build_registry(body_paragraphs, pattern)
 
@@ -704,13 +778,11 @@ def process_numbered(root, paragraphs, header_root, cfg):
 
     # 마무리 목록 수집 및 본문 미등장 증거 경고
     list_items = []
-    if section_idx is not None:
+    if section_idx is not None and keyword_only_idx is None:
         list_items = collect_list_items(paragraphs, section_idx, header_root, pattern)
         for _, _, old_n, name in list_items:
             if old_n not in registry:
                 if not name.strip():
-                    # 이름 없는 입증방법 항목은 자리표시자이므로 무시
-                    # (예: "갑 제1호증" 만 적혀있고 증거 이름이 없는 경우)
                     continue
                 print(f"[경고] {cfg['format_name'](old_n)}이(가) 마무리 목록에는 있으나, 실제 본문에는 없습니다. ({name[:40]})")
                 registry[old_n] = name
@@ -719,14 +791,20 @@ def process_numbered(root, paragraphs, header_root, cfg):
     # 동일 이름 증거 병합 (갑 제3호증, 갑 제6호증 둘 다 '공급계약서' → 하나로)
     order, registry, merge_map = deduplicate_registry(order, registry, cfg)
 
-    # 유사 증거명 그룹핑 (영상1, 영상2 → 제N-1호증, 제N-2호증)
-    groups = group_evidence(order, registry)
-    mapping = build_grouped_mapping(groups)
+    # 그룹핑: 원본 하위번호가 있으면 해당 구조 유지, 없으면 유사 이름 그룹핑
+    if sub_origin:
+        groups = _group_by_original_main(order, sub_origin)
+    else:
+        groups = group_evidence(order, registry)
+    start_n = min(order) if order else 1
+    mapping = build_grouped_mapping(groups, sub_origin=sub_origin, start_n=start_n)
 
     # merge_map의 나중 번호도 mapping에 반영
     for later_n, first_n in merge_map.items():
         mapping[later_n] = mapping[first_n]
 
+    if start_n > 1:
+        print(f"[참고] 시작 번호: {start_n} (이전 제출분 이후)")
     print("=" * 60)
     print(f"[확인] {cfg['label']} 번호 재매핑")
     print("-" * 60)
@@ -748,7 +826,9 @@ def process_numbered(root, paragraphs, header_root, cfg):
 
     # 마무리 목록 재생성 (그룹핑 반영)
     if section_idx is not None and list_items:
-        _regenerate_list(root, list_items, groups, registry, cfg)
+        _regenerate_list(root, list_items, groups, registry, cfg, sub_origin=sub_origin, start_n=start_n)
+    elif keyword_only_idx is not None:
+        _insert_list_after_keyword(root, paragraphs, keyword_only_idx, groups, registry, cfg, sub_origin=sub_origin, start_n=start_n)
 
     return True
 
@@ -767,11 +847,15 @@ def process_nonum(root, paragraphs, header_root, cfg):
         # "입증방법" 키워드 단독 + 다음 줄에 "을 제호증" 패턴
         section_idx = _find_section_idx_nonum(paragraphs)
 
+    keyword_only_idx = None
     if section_idx is None:
-        print(f"[경고] 마무리 섹션을 찾지 못했습니다. 본문 치환만 수행합니다.")
-        body_paragraphs = paragraphs
-    else:
-        body_paragraphs = paragraphs[:section_idx]
+        keyword_only_idx = _find_keyword_idx(paragraphs)
+        if keyword_only_idx is not None:
+            print(f"[참고] 마무리 섹션 키워드를 찾았으나 목록이 비어있습니다. 새로 생성합니다.")
+            section_idx = keyword_only_idx
+        else:
+            print(f"[경고] 마무리 섹션을 찾지 못했습니다. 본문 치환만 수행합니다.")
+    body_paragraphs = paragraphs[:section_idx] if section_idx is not None else paragraphs
 
     order, registry = build_registry_nonum(body_paragraphs, pattern)
 
@@ -781,7 +865,7 @@ def process_nonum(root, paragraphs, header_root, cfg):
 
     # 입증방법 목록 수집 (번호 있는 을 제N호증 패턴)
     list_items = []
-    if section_idx is not None:
+    if section_idx is not None and keyword_only_idx is None:
         list_items = collect_list_items_for_b(paragraphs, section_idx, header_root)
 
     print("=" * 60)
@@ -800,13 +884,12 @@ def process_nonum(root, paragraphs, header_root, cfg):
             set_para_texts(para_el, replaced)
 
     # 마무리 목록 재생성
+    # nonum 모드에서는 그룹핑 없이 order를 단일 항목 그룹으로 변환
+    nonum_groups = [[n] for n in order]
     if section_idx is not None and list_items:
-        _regenerate_list(root, list_items, order, registry, cfg)
-    elif section_idx is not None:
-        # 입증방법 헤더는 있지만 목록이 비어있거나 패턴이 다른 경우
-        # 기존 목록 항목을 찾아 재생성 시도
-        print(f"\n[참고] 입증방법 목록 항목을 재생성할 템플릿을 찾지 못했습니다.")
-        print(f"       입증방법 목록을 수동으로 확인해주세요.")
+        _regenerate_list(root, list_items, nonum_groups, registry, cfg)
+    elif keyword_only_idx is not None:
+        _insert_list_after_keyword(root, paragraphs, keyword_only_idx, nonum_groups, registry, cfg)
 
     return True
 
@@ -832,7 +915,7 @@ def _find_section_idx_nonum(paragraphs):
 # ═══════════════════════════════════════════════════════════════
 # 공통: 마무리 목록 재생성
 # ═══════════════════════════════════════════════════════════════
-def _regenerate_list(root, list_items, groups, registry, cfg):
+def _regenerate_list(root, list_items, groups, registry, cfg, sub_origin=None, start_n=1):
     """마무리 목록 단락을 삭제하고 새 목록으로 교체. groups 기반 하위번호 지원."""
     # 자동번호 스타일 템플릿 우선 선택, 없으면 첫 항목 사용
     tmpl_is_auto = False
@@ -850,28 +933,28 @@ def _regenerate_list(root, list_items, groups, registry, cfg):
     end_pos = root_children.index(last_para)
 
     new_lines = []
-    seq = 0
-    main_n = 0
+    main_n = start_n - 1
     use_fixed = cfg.get("seq_fixed", True)
     for group in groups:
         main_n += 1
-        if len(group) == 1:
-            seq += 1
+        has_sub = sub_origin and any(k in sub_origin for k in group)
+        if len(group) == 1 and not has_sub:
             old_key = group[0]
             name = registry[old_key]
             label = str(main_n)
             line = cfg["format_line"](label, name)
             if not tmpl_is_auto and cfg.get("needs_seq_prefix", True):
-                line = f"{'1' if use_fixed else seq}. {line}"
+                prefix = "1" if use_fixed else str(main_n)
+                line = f"{prefix}. {line}"
             new_lines.append(line)
         else:
             for sub_n, old_key in enumerate(group, start=1):
-                seq += 1
                 name = registry[old_key]
                 label = f"{main_n}-{sub_n}"
                 line = cfg["format_line"](label, name)
                 if not tmpl_is_auto and cfg.get("needs_seq_prefix", True):
-                    line = f"{'1' if use_fixed else seq}. {line}"
+                    prefix = "1" if use_fixed else f"{main_n}-{sub_n}"
+                    line = f"{prefix}. {line}"
                 new_lines.append(line)
 
     for i in range(end_pos, start_pos - 1, -1):
@@ -882,6 +965,68 @@ def _regenerate_list(root, list_items, groups, registry, cfg):
         root.insert(start_pos, new_para)
 
     print(f"\n[완료] 마무리 목록 재생성 완료 ({len(new_lines)}개 항목)")
+
+
+def _find_body_template(paragraphs, keyword_idx, cfg):
+    """마무리 섹션 키워드 아래에 기존 목록 항목이 있으면 그 단락을,
+    없으면 본문에서 증거 인용이 있는 일반 단락을 템플릿으로 반환."""
+    pattern = cfg["pattern"]
+    # 1순위: 키워드 바로 아래에 번호 목록 항목이 있는 경우 (예: "1. 갑 제1호증")
+    for para_el in paragraphs[keyword_idx + 1:]:
+        text = get_para_texts(para_el).strip()
+        if not text:
+            continue
+        cleaned = re.sub(r"\s", "", text)
+        if cleaned in SECTION_KEYWORDS:
+            break
+        if re.match(r'^\d', text) or text.startswith('-'):
+            return para_el
+    # 2순위: 본문에서 증거 패턴이 포함된 일반 단락
+    for para_el in paragraphs[:keyword_idx]:
+        text = get_para_texts(para_el).strip()
+        if pattern.search(text):
+            return para_el
+    return None
+
+
+def _insert_list_after_keyword(root, paragraphs, keyword_idx, groups, registry, cfg, sub_origin=None, start_n=1):
+    """목록이 비어있는 마무리 섹션 키워드 뒤에 새 목록을 삽입."""
+    keyword_para = paragraphs[keyword_idx]
+    tmpl = _find_body_template(paragraphs, keyword_idx, cfg) or keyword_para
+
+    new_lines = []
+    main_n = start_n - 1
+    use_fixed = cfg.get("seq_fixed", True)
+    for group in groups:
+        main_n += 1
+        has_sub = sub_origin and any(k in sub_origin for k in group)
+        if len(group) == 1 and not has_sub:
+            old_key = group[0]
+            name = registry[old_key]
+            label = str(main_n)
+            line = cfg["format_line"](label, name)
+            if cfg.get("needs_seq_prefix", True):
+                prefix = "1" if use_fixed else str(main_n)
+                line = f"{prefix}. {line}"
+            new_lines.append(line)
+        else:
+            for sub_n, old_key in enumerate(group, start=1):
+                name = registry[old_key]
+                label = f"{main_n}-{sub_n}"
+                line = cfg["format_line"](label, name)
+                if cfg.get("needs_seq_prefix", True):
+                    prefix = "1" if use_fixed else f"{main_n}-{sub_n}"
+                    line = f"{prefix}. {line}"
+                new_lines.append(line)
+
+    root_children = list(root)
+    insert_pos = root_children.index(keyword_para) + 1
+
+    for line in reversed(new_lines):
+        new_para = clone_para_with_text(tmpl, line)
+        root.insert(insert_pos, new_para)
+
+    print(f"\n[완료] 빈 마무리 섹션에 목록 생성 완료 ({len(new_lines)}개 항목)")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -920,51 +1065,56 @@ def extract_evidence_names(hwpx_path):
     header_root = ET.fromstring(header_bytes)
 
     mode = detect_mode(paragraphs)
-    cfg = MODE_CONFIGS[mode]
     if mode == "exhibit_b_nonum":
         mode = "exhibit_b"
-        cfg = MODE_CONFIGS[mode]
     elif mode == "exhibit_sa_nonum":
         mode = "exhibit_sa"
-        cfg = MODE_CONFIGS[mode]
 
+    # 감지된 모드를 먼저 시도, 실패 시 다른 모드도 시도
+    mode_order = [mode] + [m for m in _LABELED_PATTERNS if m != mode]
+
+    for try_mode in mode_order:
+        cfg = MODE_CONFIGS[try_mode]
+        labeled_re = _LABELED_PATTERNS.get(try_mode)
+        list_start = cfg["list_start"]
+
+        section_idx = find_section_idx(paragraphs, list_start)
+        evidence = {}
+
+        if section_idx is not None and labeled_re:
+            for i in range(section_idx + 1, len(paragraphs)):
+                text = get_para_texts(paragraphs[i]).strip()
+                if not text:
+                    continue
+                m = labeled_re.search(text)
+                if m:
+                    label = _labeled_match_to_label(m)
+                    name = text[m.end():].strip()
+                    name = re.sub(r"^[\.\s]+", "", name)
+                    if name:
+                        evidence[label] = name
+                else:
+                    m2 = _SIMPLE_LIST_RE.match(text)
+                    if not m2:
+                        break
+                    label = m2.group(1)
+                    name = m2.group(2).strip()
+                    if name:
+                        evidence[label] = name
+
+        if evidence:
+            return evidence, cfg
+
+    # 어떤 모드에서도 리스트를 찾지 못한 경우 본문에서 추출
+    cfg = MODE_CONFIGS[mode]
     labeled_re = _LABELED_PATTERNS.get(mode)
-    pattern = cfg["pattern"]
-    list_start = cfg["list_start"]
-
-    section_idx = find_section_idx(paragraphs, list_start)
-    evidence = {}
-
-    if section_idx is not None and labeled_re:
-        for i in range(section_idx + 1, len(paragraphs)):
-            text = get_para_texts(paragraphs[i]).strip()
-            if not text:
-                continue
-            m = labeled_re.search(text)
-            if m:
-                label = _labeled_match_to_label(m)
-                name = text[m.end():].strip()
-                name = re.sub(r"^[\.\s]+", "", name)
-                if name:
-                    evidence[label] = name
-            else:
-                m2 = _SIMPLE_LIST_RE.match(text)
-                if not m2:
-                    break
-                label = m2.group(1)
-                name = m2.group(2).strip()
-                if name:
-                    evidence[label] = name
-
-    if not evidence:
-        if labeled_re:
-            body = paragraphs[:section_idx] if section_idx else paragraphs
-            _, reg = _build_registry_labeled(body, labeled_re)
-            evidence = {label: name.strip() for label, name in reg.items() if name.strip()}
-        else:
-            body = paragraphs[:section_idx] if section_idx else paragraphs
-            _, reg = build_registry(body, pattern)
-            evidence = {str(n): name.strip() for n, name in reg.items() if name.strip()}
+    if labeled_re:
+        _, reg = _build_registry_labeled(paragraphs, labeled_re)
+        evidence = {label: name.strip() for label, name in reg.items() if name.strip()}
+    else:
+        pattern = cfg["pattern"]
+        _, reg = build_registry(paragraphs, pattern)
+        evidence = {str(n): name.strip() for n, name in reg.items() if name.strip()}
 
     return evidence, cfg
 
@@ -1005,7 +1155,7 @@ def _strip_exhibit_prefix(fname_no_ext):
         return clean, old_label
 
     # 참고자료
-    m2 = re.match(r"^참고자료\s*(\d+)\s*\.?\s*", fname_no_ext)
+    m2 = re.match(r"^참고자료\s*(\d+(?:-\d+)?)\s*\.?\s*", fname_no_ext)
     if m2:
         old_label = m2.group(1)
         clean = fname_no_ext[m2.end():].strip()
@@ -1209,10 +1359,10 @@ def renumber_hwpx(input_path, output_path):
     header_root = ET.fromstring(header_bytes)
     print(f"[섹션] {main_section}")
 
-    # 전처리: 하위번호(제N-M호증) 평탄화 → 번호 없는 증거에 임시 번호 부여
-    _flatten_subnumbers(paragraphs)
-    preprocess_all_unnumbered(paragraphs)
+    # 전처리: 하위번호(제N-M호증) 평탄화
+    sub_origin = _flatten_subnumbers(paragraphs)
 
+    # 모드 감지는 번호 없는 증거 전처리 전에 수행 (전처리가 nonum 패턴을 소멸시키므로)
     mode = detect_mode(paragraphs)
     cfg = MODE_CONFIGS[mode]
     print(f"[감지] 문서 유형: {cfg['label']}")
@@ -1220,7 +1370,8 @@ def renumber_hwpx(input_path, output_path):
     if mode in ("exhibit_b_nonum", "exhibit_sa_nonum"):
         success = process_nonum(root, paragraphs, header_root, cfg)
     else:
-        success = process_numbered(root, paragraphs, header_root, cfg)
+        preprocess_all_unnumbered(paragraphs)
+        success = process_numbered(root, paragraphs, header_root, cfg, sub_origin=sub_origin)
 
     if not success:
         return
@@ -1252,10 +1403,10 @@ def preview_only(input_path):
     header_root = ET.fromstring(header_bytes)
     print(f"[섹션] {main_section}")
 
-    # 전처리: 하위번호 평탄화 → 번호 없는 증거 임시 번호 (미리보기용, 원본 미변경)
-    _flatten_subnumbers(paragraphs)
-    preprocess_all_unnumbered(paragraphs)
+    # 전처리: 하위번호 평탄화
+    sub_origin = _flatten_subnumbers(paragraphs)
 
+    # 모드 감지는 번호 없는 증거 전처리 전에 수행
     mode = detect_mode(paragraphs)
     cfg = MODE_CONFIGS[mode]
     print(f"[감지] 문서 유형: {cfg['label']}")
@@ -1263,10 +1414,13 @@ def preview_only(input_path):
     if mode in ("exhibit_b_nonum", "exhibit_sa_nonum"):
         _preview_nonum(paragraphs, header_root, cfg)
     else:
-        _preview_numbered(paragraphs, header_root, cfg)
+        preprocess_all_unnumbered(paragraphs)
+        _preview_numbered(paragraphs, header_root, cfg, sub_origin=sub_origin)
 
 
-def _preview_numbered(paragraphs, header_root, cfg):
+def _preview_numbered(paragraphs, header_root, cfg, sub_origin=None):
+    if sub_origin is None:
+        sub_origin = {}
     pattern = cfg["pattern"]
     list_start = cfg["list_start"]
 
@@ -1291,12 +1445,18 @@ def _preview_numbered(paragraphs, header_root, cfg):
     # 동일 이름 증거 병합
     order, registry, merge_map = deduplicate_registry(order, registry, cfg)
 
-    # 유사 증거명 그룹핑
-    groups = group_evidence(order, registry)
-    mapping = build_grouped_mapping(groups)
+    # 그룹핑
+    if sub_origin:
+        groups = _group_by_original_main(order, sub_origin)
+    else:
+        groups = group_evidence(order, registry)
+    start_n = min(order) if order else 1
+    mapping = build_grouped_mapping(groups, sub_origin=sub_origin, start_n=start_n)
     for later_n, first_n in merge_map.items():
         mapping[later_n] = mapping[first_n]
 
+    if start_n > 1:
+        print(f"[참고] 시작 번호: {start_n} (이전 제출분 이후)")
     print("=" * 60)
     print(f"[미리보기] {cfg['label']} 번호 재매핑 결과")
     print("-" * 60)
@@ -1310,17 +1470,25 @@ def _preview_numbered(paragraphs, header_root, cfg):
             print(f"  {cfg['format_name'](later_n)} → {cfg['format_name'](mapping[later_n])}  (동일 증거 병합)")
     print("-" * 60)
     print(f"\n[확인] 재생성될 마무리 목록:")
-    seq = 0
-    main_n = 0
+    main_n = start_n - 1
     use_fixed = cfg.get("seq_fixed", True)
     for group in groups:
         main_n += 1
+        has_sub = sub_origin and any(k in sub_origin for k in group)
         for sub_idx, old_key in enumerate(group):
-            seq += 1
-            label = str(main_n) if len(group) == 1 else f"{main_n}-{sub_idx + 1}"
+            if len(group) == 1 and not has_sub:
+                label = str(main_n)
+            else:
+                label = f"{main_n}-{sub_idx + 1}"
             line = cfg['format_line'](label, registry[old_key])
             if cfg.get("needs_seq_prefix", True):
-                line = f"{'1' if use_fixed else seq}. {line}"
+                if use_fixed:
+                    prefix = "1"
+                elif len(group) == 1 and not has_sub:
+                    prefix = str(main_n)
+                else:
+                    prefix = f"{main_n}-{sub_idx + 1}"
+                line = f"{prefix}. {line}"
             print(f"  {line}")
     print("=" * 60)
 
