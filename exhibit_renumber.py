@@ -475,8 +475,8 @@ def detect_mode(paragraphs):
         if cleaned not in SECTION_KEYWORDS:
             ref_nonum_count += len(REFERENCE_NONUM_RE.findall(ref_remaining))
 
-    # 번호 없는 을호증이 있으면 우선
-    if b_nonum_count > 0:
+    # 번호 없는 을호증"만" 있으면 nonum 모드 (번호 있는 을호증이 함께 있으면 exhibit_b로)
+    if b_nonum_count > 0 and b_count == 0:
         return "exhibit_b_nonum"
     # 번호 없는 소갑호증이 있으면 우선
     if sa_nonum_count > 0 and sa_count == 0:
