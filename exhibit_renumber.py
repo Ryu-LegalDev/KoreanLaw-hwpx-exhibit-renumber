@@ -796,7 +796,12 @@ def process_numbered(root, paragraphs, header_root, cfg, sub_origin=None):
         groups = _group_by_original_main(order, sub_origin)
     else:
         groups = group_evidence(order, registry)
-    start_n = min(order) if order else 1
+    if sub_origin and order:
+        original_mains = [main for main, _sub in sub_origin.values()]
+        non_sub_keys = [k for k in order if k not in sub_origin]
+        start_n = min(original_mains + non_sub_keys)
+    else:
+        start_n = min(order) if order else 1
     mapping = build_grouped_mapping(groups, sub_origin=sub_origin, start_n=start_n)
 
     # merge_map의 나중 번호도 mapping에 반영
@@ -1450,7 +1455,12 @@ def _preview_numbered(paragraphs, header_root, cfg, sub_origin=None):
         groups = _group_by_original_main(order, sub_origin)
     else:
         groups = group_evidence(order, registry)
-    start_n = min(order) if order else 1
+    if sub_origin and order:
+        original_mains = [main for main, _sub in sub_origin.values()]
+        non_sub_keys = [k for k in order if k not in sub_origin]
+        start_n = min(original_mains + non_sub_keys)
+    else:
+        start_n = min(order) if order else 1
     mapping = build_grouped_mapping(groups, sub_origin=sub_origin, start_n=start_n)
     for later_n, first_n in merge_map.items():
         mapping[later_n] = mapping[first_n]
