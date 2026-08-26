@@ -7,6 +7,7 @@ HWPX 파일에서 증거 번호를 본문 등장 순서 기준으로 자동 재�
     - 소장/준비서면(원고): '갑 제N호증'
     - 답변서/준비서면(피고): '을 제N호증' 또는 '을 제호증' (번호 미기재 시 자동 부여)
     - 행정심판청구서/가처분신청서/가처분취소신청서: '소갑 제N호증' (소명방법)
+    - 고소장/고발장: '증 제N호증' (증거자료)
     - 변호인의견서: '참고자료 N'
 
 사용법:
@@ -72,6 +73,11 @@ EXHIBIT_B_NONUM_RE = re.compile(r"을\s*제호증")
 # 소갑호증 (번호 없음) — "소갑 제호증"
 EXHIBIT_SA_NONUM_RE = re.compile(r"소갑\s*제호증")
 
+# 증호증 (고소장/고발장 등) — 번호 있음/없음
+EXHIBIT_E_RE = re.compile(r"증\s*제(\d+)(?:-\d+)?호증(?:의\s*\d+)?")
+EXHIBIT_E_LIST_RE = re.compile(r"^(?:\d+[\.\s]+)?증\s*제\d+(?:-\d+)?호증(?:의\s*\d+)?")
+EXHIBIT_E_NONUM_RE = re.compile(r"증\s*제호증")
+
 # 참고자료
 REFERENCE_RE = re.compile(r"참고자료\s*(\d{1,3})(?!\d)")
 REFERENCE_NONUM_RE = re.compile(r"참고자료\s+(?!목록)\S")
@@ -89,6 +95,9 @@ _EXHIBIT_SUB_PATTERNS = [
     (re.compile(r"(소갑\s*제)\d+-\d+(호증)"),
      re.compile(r"(소갑\s*제)\d+(호증)의\s*\d+"),
      EXHIBIT_SA_RE, "소갑"),
+    (re.compile(r"(증\s*제)\d+-\d+(호증)"),
+     re.compile(r"(증\s*제)\d+(호증)의\s*\d+"),
+     EXHIBIT_E_RE, "증"),
     (re.compile(r"(참고자료\s*)\d+-\d+()"),
      re.compile(r"(참고자료\s*)\d+()의\s*\d+"),
      REFERENCE_RE, "참고자료"),
@@ -99,6 +108,7 @@ _EXHIBIT_SUB_PATTERNS = [
 _EXHIBIT_A_LABELED_RE = re.compile(r"(?<!소)갑\s*제(\d+)(?:-(\d+))?호증(?:의\s*(\d+))?")
 _EXHIBIT_B_LABELED_RE = re.compile(r"을\s*제(\d+)(?:-(\d+))?호증(?:의\s*(\d+))?")
 _EXHIBIT_SA_LABELED_RE = re.compile(r"소갑\s*제(\d+)(?:-(\d+))?호증(?:의\s*(\d+))?")
+_EXHIBIT_E_LABELED_RE = re.compile(r"증\s*제(\d+)(?:-(\d+))?호증(?:의\s*(\d+))?")
 
 
 def _labeled_match_to_label(m):
@@ -110,7 +120,7 @@ def _labeled_match_to_label(m):
     return f"{main}-{sub}" if sub else main
 
 # 마무리 섹션 헤더 키워드 (공백 제거 후 비교)
-SECTION_KEYWORDS = {"입증방법", "소명방법", "참고자료", "첨부서류", "첨부자료", "참고자료목록"}
+SECTION_KEYWORDS = {"입증방법", "소명방법", "참고자료", "첨부서류", "첨부자료", "참고자료목록", "증거자료"}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -257,6 +267,7 @@ def preprocess_all_unnumbered(paragraphs):
         (EXHIBIT_A_RE, EXHIBIT_A_NONUM_RE, "갑호증"),
         (EXHIBIT_B_RE, EXHIBIT_B_NONUM_RE, "을호증"),
         (EXHIBIT_SA_RE, EXHIBIT_SA_NONUM_RE, "소갑호증"),
+        (EXHIBIT_E_RE, EXHIBIT_E_NONUM_RE, "증호증"),
     ]:
         # 현재 최대 번호 확인
         max_n = 0
@@ -349,11 +360,12 @@ def _find_main_section(z):
     sections = _find_section_files(z)
     best = None
     best_count = -1
-    all_patterns = [EXHIBIT_A_RE, EXHIBIT_B_RE, EXHIBIT_SA_RE, REFERENCE_RE]
+    all_patterns = [EXHIBIT_A_RE, EXHIBIT_B_RE, EXHIBIT_SA_RE, EXHIBIT_E_RE, REFERENCE_RE]
     nonum_pairs = [
         (EXHIBIT_A_RE, EXHIBIT_A_NONUM_RE),
         (EXHIBIT_B_RE, EXHIBIT_B_NONUM_RE),
         (EXHIBIT_SA_RE, EXHIBIT_SA_NONUM_RE),
+        (EXHIBIT_E_RE, EXHIBIT_E_NONUM_RE),
     ]
     for sec_name in sections:
         root = ET.fromstring(z.read(sec_name))
@@ -447,13 +459,15 @@ def clone_para_with_text(template_para, new_text):
 def detect_mode(paragraphs):
     """
     문서 전체를 분석하여 유형 판별.
-    반환: "exhibit_a" | "exhibit_b" | "exhibit_b_nonum" | "exhibit_sa" | "exhibit_sa_nonum" | "reference"
+    반환: "exhibit_a" | "exhibit_b" | "exhibit_b_nonum" | "exhibit_sa" | "exhibit_sa_nonum" | "exhibit_e" | "exhibit_e_nonum" | "reference"
     """
     a_count = 0
     b_count = 0
     b_nonum_count = 0
     sa_count = 0
     sa_nonum_count = 0
+    e_count = 0
+    e_nonum_count = 0
     ref_count = 0
     ref_nonum_count = 0
 
@@ -462,6 +476,7 @@ def detect_mode(paragraphs):
         a_count += len(EXHIBIT_A_RE.findall(text))
         b_count += len(EXHIBIT_B_RE.findall(text))
         sa_count += len(EXHIBIT_SA_RE.findall(text))
+        e_count += len(EXHIBIT_E_RE.findall(text))
         ref_count += len(REFERENCE_RE.findall(text))
         # 을 제호증 (번호 없음) — 을 제N호증으로 이미 매칭된 부분 제외
         remaining = EXHIBIT_B_RE.sub("", text)
@@ -469,6 +484,9 @@ def detect_mode(paragraphs):
         # 소갑 제호증 (번호 없음)
         sa_remaining = EXHIBIT_SA_RE.sub("", text)
         sa_nonum_count += len(EXHIBIT_SA_NONUM_RE.findall(sa_remaining))
+        # 증 제호증 (번호 없음)
+        e_remaining = EXHIBIT_E_RE.sub("", text)
+        e_nonum_count += len(EXHIBIT_E_NONUM_RE.findall(e_remaining))
         # 참고자료 (번호 없음) — 참고자료 N으로 이미 매칭된 부분 제외
         ref_remaining = REFERENCE_RE.sub("", text)
         cleaned = re.sub(r"\s", "", text.strip())
@@ -481,11 +499,15 @@ def detect_mode(paragraphs):
     # 번호 없는 소갑호증이 있으면 우선
     if sa_nonum_count > 0 and sa_count == 0:
         return "exhibit_sa_nonum"
+    # 번호 없는 증호증"만" 있으면 nonum 모드
+    if e_nonum_count > 0 and e_count == 0:
+        return "exhibit_e_nonum"
     # 나머지는 개수 비교 (번호 없는 참고자료도 포함)
     counts = {
         "exhibit_a": a_count,
         "exhibit_b": b_count,
         "exhibit_sa": sa_count + sa_nonum_count,
+        "exhibit_e": e_count + e_nonum_count,
         "reference": ref_count + ref_nonum_count,
     }
     best = max(counts, key=counts.get)
@@ -556,6 +578,26 @@ MODE_CONFIGS = {
         "needs_seq_prefix": True,
         "seq_fixed": True,
         "folder_suffix": "_소명방법",
+    },
+    "exhibit_e": {
+        "label": "증호증",
+        "pattern": EXHIBIT_E_RE,
+        "list_start": EXHIBIT_E_LIST_RE,
+        "format_name": lambda n: _fmt_exhibit("증", n),
+        "format_line": lambda n, name: f"{_fmt_exhibit('증', n)} {name}",
+        "needs_seq_prefix": True,
+        "seq_fixed": True,
+        "folder_suffix": "_증거자료",
+    },
+    "exhibit_e_nonum": {
+        "label": "증호증 (번호 미기재)",
+        "pattern": EXHIBIT_E_NONUM_RE,
+        "list_start": EXHIBIT_E_LIST_RE,
+        "format_name": lambda n: _fmt_exhibit("증", n),
+        "format_line": lambda n, name: f"{_fmt_exhibit('증', n)} {name}",
+        "needs_seq_prefix": True,
+        "seq_fixed": True,
+        "folder_suffix": "_증거자료",
     },
     "reference": {
         "label": "참고자료",
@@ -868,16 +910,24 @@ def process_nonum(root, paragraphs, header_root, cfg):
         print(f"{cfg['label']}을(를) 발견하지 못했습니다.")
         return False
 
-    # 입증방법 목록 수집 (번호 있는 을 제N호증 패턴)
+    # 입증방법 목록 수집 (번호 있는 패턴으로)
+    _NONUM_TO_NUMBERED = {
+        "exhibit_b_nonum": EXHIBIT_B_RE,
+        "exhibit_sa_nonum": EXHIBIT_SA_RE,
+        "exhibit_e_nonum": EXHIBIT_E_RE,
+    }
+    numbered_pattern = _NONUM_TO_NUMBERED.get(
+        next((k for k, v in MODE_CONFIGS.items() if v is cfg), ""), EXHIBIT_B_RE)
     list_items = []
     if section_idx is not None and keyword_only_idx is None:
-        list_items = collect_list_items_for_b(paragraphs, section_idx, header_root)
+        list_items = collect_list_items(paragraphs, section_idx, header_root, numbered_pattern)
 
+    nonum_label = cfg['format_name']('')
     print("=" * 60)
     print(f"[확인] {cfg['label']} → 번호 자동 부여")
     print("-" * 60)
     for n in order:
-        print(f"  을 제호증 → 을 제{n}호증  ({registry[n][:40]})")
+        print(f"  {nonum_label} → {cfg['format_name'](n)}  ({registry[n][:40]})")
     print("=" * 60)
 
     # 본문: "을 제호증" → "을 제N호증" 순차 치환
@@ -900,8 +950,8 @@ def process_nonum(root, paragraphs, header_root, cfg):
 
 
 def _find_section_idx_nonum(paragraphs):
-    """번호 없는 을 제호증용 마무리 섹션 탐지 (을 제호증 패턴도 허용)."""
-    nonum_list_start = re.compile(r"^(?:\d+[\.\s]+)?을\s*제\d*호증")
+    """번호 없는 호증용 마무리 섹션 탐지 (을 제호증, 증 제호증 등)."""
+    nonum_list_start = re.compile(r"^(?:\d+[\.\s]+)?(?:을|증|소갑)\s*제\d*호증")
     for i, para_el in enumerate(paragraphs):
         text = get_para_texts(para_el)
         cleaned = re.sub(r"\s", "", text.strip())
@@ -1057,6 +1107,7 @@ _LABELED_PATTERNS = {
     "exhibit_a": _EXHIBIT_A_LABELED_RE,
     "exhibit_b": _EXHIBIT_B_LABELED_RE,
     "exhibit_sa": _EXHIBIT_SA_LABELED_RE,
+    "exhibit_e": _EXHIBIT_E_LABELED_RE,
     "reference": REFERENCE_RE,
 }
 
@@ -1074,6 +1125,8 @@ def extract_evidence_names(hwpx_path):
         mode = "exhibit_b"
     elif mode == "exhibit_sa_nonum":
         mode = "exhibit_sa"
+    elif mode == "exhibit_e_nonum":
+        mode = "exhibit_e"
 
     # 감지된 모드를 먼저 시도, 실패 시 다른 모드도 시도
     mode_order = [mode] + [m for m in _LABELED_PATTERNS if m != mode]
@@ -1372,7 +1425,7 @@ def renumber_hwpx(input_path, output_path):
     cfg = MODE_CONFIGS[mode]
     print(f"[감지] 문서 유형: {cfg['label']}")
 
-    if mode in ("exhibit_b_nonum", "exhibit_sa_nonum"):
+    if mode in ("exhibit_b_nonum", "exhibit_sa_nonum", "exhibit_e_nonum"):
         success = process_nonum(root, paragraphs, header_root, cfg)
     else:
         preprocess_all_unnumbered(paragraphs)
@@ -1416,7 +1469,7 @@ def preview_only(input_path):
     cfg = MODE_CONFIGS[mode]
     print(f"[감지] 문서 유형: {cfg['label']}")
 
-    if mode in ("exhibit_b_nonum", "exhibit_sa_nonum"):
+    if mode in ("exhibit_b_nonum", "exhibit_sa_nonum", "exhibit_e_nonum"):
         _preview_nonum(paragraphs, header_root, cfg)
     else:
         preprocess_all_unnumbered(paragraphs)
@@ -1520,8 +1573,9 @@ def _preview_nonum(paragraphs, header_root, cfg):
     print("=" * 60)
     print(f"[미리보기] {cfg['label']} → 번호 자동 부여 결과")
     print("-" * 60)
+    nonum_label = cfg['format_name']('')
     for n in order:
-        print(f"  을 제호증 → 을 제{n}호증  ({registry[n][:50]})")
+        print(f"  {nonum_label} → {cfg['format_name'](n)}  ({registry[n][:50]})")
     print("-" * 60)
     print(f"\n[확인] 재생성될 마무리 목록:")
     for new_n, old_n in enumerate(order, start=1):
