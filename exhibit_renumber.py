@@ -1212,6 +1212,14 @@ def _strip_exhibit_prefix(fname_no_ext):
         clean = fname_no_ext[m.end():].strip()
         return clean, old_label
 
+    # 증호증 (고소장/고발장)
+    m_e = re.match(r"^증\s*제(\d+)(?:-(\d+))?호증(?:의\s*(\d+))?\s*", fname_no_ext)
+    if m_e:
+        sub = m_e.group(2) or m_e.group(3)
+        old_label = f"{m_e.group(1)}-{sub}" if sub else m_e.group(1)
+        clean = fname_no_ext[m_e.end():].strip()
+        return clean, old_label
+
     # 참고자료
     m2 = re.match(r"^참고자료\s*(\d+(?:-\d+)?)\s*\.?\s*", fname_no_ext)
     if m2:
