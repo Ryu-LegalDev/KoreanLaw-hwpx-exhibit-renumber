@@ -753,36 +753,67 @@ def build_registry_nonum(paragraphs, pattern):
     """
     번호 없는 '을 제호증'의 등장 순서를 기록.
     각 '을 제호증'에 순차적으로 1, 2, 3... 번호를 부여.
-    반환: (order, registry)
-      order    : [1, 2, 3, ...] 순차 번호
+    동일 이름의 증거는 최초 등장한 번호를 재사용.
+    반환: (order, registry, seq_map)
+      order    : [1, 2, 3, ...] 고유 번호만 (중복 제거된 순서)
       registry : { n: name }
+      seq_map  : [n, n, ...] 등장 순서별 부여된 번호 (중복 포함)
     """
     registry = {}
     order = []
+    seq_map = []
     seq = 0
+    name_to_num = {}
 
     for para_el in paragraphs:
         text = get_para_texts(para_el)
         for m in pattern.finditer(text):
-            seq += 1
             name_after = text[m.end():].strip()
             name_after = re.sub(r"^[\.\s]+", "", name_after)
-            registry[seq] = name_after
-            order.append(seq)
+            existing = _find_duplicate_name(name_after, name_to_num)
+            if existing is not None:
+                seq_map.append(existing)
+            else:
+                seq += 1
+                registry[seq] = name_after
+                order.append(seq)
+                name_to_num[name_after] = seq
+                seq_map.append(seq)
 
-    return order, registry
+    return order, registry, seq_map
 
 
-def replace_nonum_sequential(text, counter, pattern):
+def _find_duplicate_name(name, name_to_num):
+    """name_to_num에서 동일 이름을 찾아 번호 반환. 없으면 None."""
+    if not name or len(name) < 2:
+        return None
+    n_name = _normalize_name(name)
+    for existing_name, num in name_to_num.items():
+        if _normalize_name(existing_name) == n_name:
+            return num
+        e_core = _core_name(existing_name)
+        n_core = _core_name(name)
+        if e_core and n_core and e_core == n_core:
+            return num
+    return None
+
+
+def replace_nonum_sequential(text, counter, pattern, seq_map=None):
     """
     번호 없는 '을 제호증'을 순차 번호로 치환.
-    counter는 [현재값]을 담은 리스트 (mutable reference).
+    counter는 [현재값]을 담은 리스트 (mutable reference) — seq_map 인덱스로 사용.
+    seq_map이 있으면 해당 인덱스의 번호를 사용 (중복 증거 동일 번호).
     """
     def replacer(m):
-        counter[0] += 1
+        if seq_map is not None:
+            idx = counter[0]
+            counter[0] += 1
+            num = seq_map[idx] if idx < len(seq_map) else idx + 1
+        else:
+            counter[0] += 1
+            num = counter[0]
         original = m.group(0)
-        # "을 제호증" → "을 제N호증" (공백 패턴 보존)
-        return original.replace("제호증", f"제{counter[0]}호증")
+        return original.replace("제호증", f"제{num}호증")
     return pattern.sub(replacer, text)
 
 
@@ -904,7 +935,7 @@ def process_nonum(root, paragraphs, header_root, cfg):
             print(f"[경고] 마무리 섹션을 찾지 못했습니다. 본문 치환만 수행합니다.")
     body_paragraphs = paragraphs[:section_idx] if section_idx is not None else paragraphs
 
-    order, registry = build_registry_nonum(body_paragraphs, pattern)
+    order, registry, seq_map = build_registry_nonum(body_paragraphs, pattern)
 
     if not order:
         print(f"{cfg['label']}을(를) 발견하지 못했습니다.")
@@ -923,6 +954,12 @@ def process_nonum(root, paragraphs, header_root, cfg):
         list_items = collect_list_items(paragraphs, section_idx, header_root, numbered_pattern)
 
     nonum_label = cfg['format_name']('')
+
+    # 중복 병합 안내
+    merged = [(i, seq_map[i]) for i in range(len(seq_map))
+              if i > 0 and seq_map[i] in seq_map[:i]]
+    for idx, num in merged:
+        print(f"[병합] {nonum_label} → {cfg['format_name'](num)}  (동일 증거: {registry[num][:40]})")
     print("=" * 60)
     print(f"[확인] {cfg['label']} → 번호 자동 부여")
     print("-" * 60)
@@ -930,11 +967,11 @@ def process_nonum(root, paragraphs, header_root, cfg):
         print(f"  {nonum_label} → {cfg['format_name'](n)}  ({registry[n][:40]})")
     print("=" * 60)
 
-    # 본문: "을 제호증" → "을 제N호증" 순차 치환
+    # 본문: "을 제호증" → "을 제N호증" 순차 치환 (중복은 동일 번호)
     counter = [0]
     for para_el in body_paragraphs:
         original = get_para_texts(para_el)
-        replaced = replace_nonum_sequential(original, counter, pattern)
+        replaced = replace_nonum_sequential(original, counter, pattern, seq_map)
         if replaced != original:
             set_para_texts(para_el, replaced)
 
@@ -1572,16 +1609,23 @@ def _preview_nonum(paragraphs, header_root, cfg):
         section_idx = _find_section_idx_nonum(paragraphs)
 
     body_paragraphs = paragraphs[:section_idx] if section_idx else paragraphs
-    order, registry = build_registry_nonum(body_paragraphs, pattern)
+    order, registry, seq_map = build_registry_nonum(body_paragraphs, pattern)
 
     if not order:
         print(f"{cfg['label']}을(를) 발견하지 못했습니다.")
         return
 
+    nonum_label = cfg['format_name']('')
+
+    # 중복 병합 안내
+    merged = [(i, seq_map[i]) for i in range(len(seq_map))
+              if i > 0 and seq_map[i] in seq_map[:i]]
+    for idx, num in merged:
+        print(f"[병합] {nonum_label} → {cfg['format_name'](num)}  (동일 증거: {registry[num][:40]})")
+
     print("=" * 60)
     print(f"[미리보기] {cfg['label']} → 번호 자동 부여 결과")
     print("-" * 60)
-    nonum_label = cfg['format_name']('')
     for n in order:
         print(f"  {nonum_label} → {cfg['format_name'](n)}  ({registry[n][:50]})")
     print("-" * 60)
