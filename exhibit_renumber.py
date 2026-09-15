@@ -9,6 +9,7 @@ HWPX 파일에서 증거 번호를 본문 등장 순서 기준으로 자동 재�
     - 행정심판청구서/가처분신청서/가처분취소신청서: '소갑 제N호증' (소명방법)
     - 고소장/고발장: '증 제N호증' (증거자료)
     - 변호인의견서: '참고자료 N'
+    - 성년후견심판청구서 등: '첨부서류' (번호 미기재 시 자동 부여)
 
 사용법:
     python exhibit_renumber.py input.hwpx               (자동 출력 파일명)
@@ -82,6 +83,11 @@ EXHIBIT_E_NONUM_RE = re.compile(r"증\s*제호증")
 REFERENCE_RE = re.compile(r"참고자료\s*(\d{1,3})(?!\d)")
 REFERENCE_NONUM_RE = re.compile(r"참고자료\s+(?!목록)\S")
 REFERENCE_LIST_RE = re.compile(r"^(?:\d+[\.\s]+)?참고자료\s*\d+|^\d+(?:-\d+)?\.\s+\S")
+
+# 첨부서류 (성년후견 심판청구서 등)
+ATTACHMENT_RE = re.compile(r"첨부서류\s*(\d+)\.?")
+ATTACHMENT_NONUM_RE = re.compile(r"첨부서류\s+(?=[^\s\d])")
+ATTACHMENT_LIST_RE = re.compile(r"^(?:\d+[\.\s]+)?첨부서류\s*\d+")
 
 # 하위번호 패턴 (평탄화용) — 구형식(제N-M호증)과 신형식(제N호증의 M) 모두 지원
 _EXHIBIT_SUB_PATTERNS = [
@@ -360,12 +366,13 @@ def _find_main_section(z):
     sections = _find_section_files(z)
     best = None
     best_count = -1
-    all_patterns = [EXHIBIT_A_RE, EXHIBIT_B_RE, EXHIBIT_SA_RE, EXHIBIT_E_RE, REFERENCE_RE]
+    all_patterns = [EXHIBIT_A_RE, EXHIBIT_B_RE, EXHIBIT_SA_RE, EXHIBIT_E_RE, REFERENCE_RE, ATTACHMENT_RE]
     nonum_pairs = [
         (EXHIBIT_A_RE, EXHIBIT_A_NONUM_RE),
         (EXHIBIT_B_RE, EXHIBIT_B_NONUM_RE),
         (EXHIBIT_SA_RE, EXHIBIT_SA_NONUM_RE),
         (EXHIBIT_E_RE, EXHIBIT_E_NONUM_RE),
+        (ATTACHMENT_RE, ATTACHMENT_NONUM_RE),
     ]
     for sec_name in sections:
         root = ET.fromstring(z.read(sec_name))
@@ -467,7 +474,7 @@ def detect_mode(paragraphs):
     """
     문서 전체를 분석하여 유형 판별.
     인용 라인(- 로 시작)에 있는 증거만 카운트하여 문서 유형 결정.
-    반환: "exhibit_a" | "exhibit_b" | "exhibit_b_nonum" | "exhibit_sa" | "exhibit_sa_nonum" | "exhibit_e" | "exhibit_e_nonum" | "reference"
+    반환: "exhibit_a" | "exhibit_b" | "exhibit_b_nonum" | "exhibit_sa" | "exhibit_sa_nonum" | "exhibit_e" | "exhibit_e_nonum" | "reference" | "attachment" | "attachment_nonum"
     """
     a_count = 0
     b_count = 0
@@ -478,9 +485,12 @@ def detect_mode(paragraphs):
     e_nonum_count = 0
     ref_count = 0
     ref_nonum_count = 0
+    att_count = 0
+    att_nonum_count = 0
 
     for para_el in paragraphs:
         text = get_para_texts(para_el)
+        cleaned = re.sub(r"\s", "", text.strip())
         # 인용 라인에 있는 증거만 카운트
         for m in EXHIBIT_A_RE.finditer(text):
             if _is_cite_context(text, m):
@@ -497,7 +507,10 @@ def detect_mode(paragraphs):
         for m in REFERENCE_RE.finditer(text):
             if _is_cite_context(text, m):
                 ref_count += 1
-        # 번호 없는 패턴은 인용 라인에서만 등장하므로 그대로 카운트
+        for m in ATTACHMENT_RE.finditer(text):
+            if _is_cite_context(text, m):
+                att_count += 1
+        # 번호 없는 패턴
         remaining = EXHIBIT_B_RE.sub("", text)
         b_nonum_count += len(EXHIBIT_B_NONUM_RE.findall(remaining))
         sa_remaining = EXHIBIT_SA_RE.sub("", text)
@@ -505,9 +518,12 @@ def detect_mode(paragraphs):
         e_remaining = EXHIBIT_E_RE.sub("", text)
         e_nonum_count += len(EXHIBIT_E_NONUM_RE.findall(e_remaining))
         ref_remaining = REFERENCE_RE.sub("", text)
-        cleaned = re.sub(r"\s", "", text.strip())
         if cleaned not in SECTION_KEYWORDS:
             ref_nonum_count += len(REFERENCE_NONUM_RE.findall(ref_remaining))
+        # 첨부서류 nonum — 섹션 키워드 제외
+        if cleaned not in SECTION_KEYWORDS:
+            att_remaining = ATTACHMENT_RE.sub("", text)
+            att_nonum_count += len(ATTACHMENT_NONUM_RE.findall(att_remaining))
 
     # 번호 없는 을호증"만" 있으면 nonum 모드 (번호 있는 을호증이 함께 있으면 exhibit_b로)
     if b_nonum_count > 0 and b_count == 0:
@@ -518,6 +534,9 @@ def detect_mode(paragraphs):
     # 번호 없는 증호증"만" 있으면 nonum 모드
     if e_nonum_count > 0 and e_count == 0:
         return "exhibit_e_nonum"
+    # 번호 없는 첨부서류"만" 있으면 nonum 모드
+    if att_nonum_count > 0 and att_count == 0:
+        return "attachment_nonum"
     # 나머지는 개수 비교 (번호 없는 참고자료도 포함)
     counts = {
         "exhibit_a": a_count,
@@ -525,6 +544,7 @@ def detect_mode(paragraphs):
         "exhibit_sa": sa_count + sa_nonum_count,
         "exhibit_e": e_count + e_nonum_count,
         "reference": ref_count + ref_nonum_count,
+        "attachment": att_count + att_nonum_count,
     }
     best = max(counts, key=counts.get)
     if counts[best] == 0:
@@ -624,6 +644,26 @@ MODE_CONFIGS = {
         "needs_seq_prefix": True,
         "seq_fixed": False,
         "folder_suffix": "_참고자료",
+    },
+    "attachment": {
+        "label": "첨부서류",
+        "pattern": ATTACHMENT_RE,
+        "list_start": ATTACHMENT_LIST_RE,
+        "format_name": lambda n: f"첨부서류 {n}" if n != '' else "첨부서류",
+        "format_line": lambda n, name: f"첨부서류 {n}. {name}",
+        "needs_seq_prefix": False,
+        "seq_fixed": True,
+        "folder_suffix": "_첨부서류",
+    },
+    "attachment_nonum": {
+        "label": "첨부서류 (번호 미기재)",
+        "pattern": ATTACHMENT_NONUM_RE,
+        "list_start": ATTACHMENT_LIST_RE,
+        "format_name": lambda n: f"첨부서류 {n}" if n != '' else "첨부서류",
+        "format_line": lambda n, name: f"첨부서류 {n}. {name}",
+        "needs_seq_prefix": False,
+        "seq_fixed": True,
+        "folder_suffix": "_첨부서류",
     },
 }
 
@@ -829,7 +869,9 @@ def replace_nonum_sequential(text, counter, pattern, seq_map=None):
             counter[0] += 1
             num = counter[0]
         original = m.group(0)
-        return original.replace("제호증", f"제{num}호증")
+        if "제호증" in original:
+            return original.replace("제호증", f"제{num}호증")
+        return re.sub(r"(첨부서류)\s*", rf"\1 {num}. ", original)
     return pattern.sub(replacer, text)
 
 
@@ -962,6 +1004,7 @@ def process_nonum(root, paragraphs, header_root, cfg):
         "exhibit_b_nonum": EXHIBIT_B_RE,
         "exhibit_sa_nonum": EXHIBIT_SA_RE,
         "exhibit_e_nonum": EXHIBIT_E_RE,
+        "attachment_nonum": ATTACHMENT_RE,
     }
     numbered_pattern = _NONUM_TO_NUMBERED.get(
         next((k for k, v in MODE_CONFIGS.items() if v is cfg), ""), EXHIBIT_B_RE)
@@ -1004,7 +1047,7 @@ def process_nonum(root, paragraphs, header_root, cfg):
 
 def _find_section_idx_nonum(paragraphs):
     """번호 없는 호증용 마무리 섹션 탐지 (을 제호증, 증 제호증 등)."""
-    nonum_list_start = re.compile(r"^(?:\d+[\.\s]+)?(?:을|증|소갑)\s*제\d*호증")
+    nonum_list_start = re.compile(r"^(?:\d+[\.\s]+)?(?:(?:을|증|소갑)\s*제\d*호증|첨부서류\s*\d*)")
     for i, para_el in enumerate(paragraphs):
         text = get_para_texts(para_el)
         cleaned = re.sub(r"\s", "", text.strip())
@@ -1162,6 +1205,7 @@ _LABELED_PATTERNS = {
     "exhibit_sa": _EXHIBIT_SA_LABELED_RE,
     "exhibit_e": _EXHIBIT_E_LABELED_RE,
     "reference": REFERENCE_RE,
+    "attachment": ATTACHMENT_RE,
 }
 
 
@@ -1180,6 +1224,8 @@ def extract_evidence_names(hwpx_path):
         mode = "exhibit_sa"
     elif mode == "exhibit_e_nonum":
         mode = "exhibit_e"
+    elif mode == "attachment_nonum":
+        mode = "attachment"
 
     # 감지된 모드를 먼저 시도, 실패 시 다른 모드도 시도
     mode_order = [mode] + [m for m in _LABELED_PATTERNS if m != mode]
@@ -1224,7 +1270,11 @@ def extract_evidence_names(hwpx_path):
         evidence = {label: name.strip() for label, name in reg.items() if name.strip()}
     else:
         pattern = cfg["pattern"]
-        _, reg = build_registry(paragraphs, pattern)
+        # nonum 패턴인 경우 build_registry_nonum 사용
+        if mode in ("attachment_nonum",):
+            _, reg, _ = build_registry_nonum(paragraphs, pattern)
+        else:
+            _, reg = build_registry(paragraphs, pattern)
         evidence = {str(n): name.strip() for n, name in reg.items() if name.strip()}
 
     return evidence, cfg
@@ -1280,10 +1330,22 @@ def _strip_exhibit_prefix(fname_no_ext):
         clean = fname_no_ext[m2.end():].strip()
         return clean, old_label
 
-    # 번호 없는 접두사 (갑 제호증, 을 제호증, 소갑 제호증, 증 제호증)
+    # 첨부서류 (번호 있음)
+    m_att = re.match(r"^첨부서류\s*(\d+)\.?\s*", fname_no_ext)
+    if m_att:
+        old_label = m_att.group(1)
+        clean = fname_no_ext[m_att.end():].strip()
+        return clean, old_label
+
+    # 번호 없는 접두사 (갑 제호증, 을 제호증, 소갑 제호증, 증 제호증, 첨부서류)
     m_nonum = re.match(r"^(?:소갑|갑|을|증)\s*제호증\s*", fname_no_ext)
     if m_nonum:
         clean = fname_no_ext[m_nonum.end():].strip()
+        return clean, None
+
+    m_att_nonum = re.match(r"^첨부서류\s+(?=[^\s\d])", fname_no_ext)
+    if m_att_nonum:
+        clean = fname_no_ext[m_att_nonum.end():].strip()
         return clean, None
 
     return fname_no_ext.strip(), None
@@ -1492,7 +1554,7 @@ def renumber_hwpx(input_path, output_path):
     cfg = MODE_CONFIGS[mode]
     print(f"[감지] 문서 유형: {cfg['label']}")
 
-    if mode in ("exhibit_b_nonum", "exhibit_sa_nonum", "exhibit_e_nonum"):
+    if mode in ("exhibit_b_nonum", "exhibit_sa_nonum", "exhibit_e_nonum", "attachment_nonum"):
         success = process_nonum(root, paragraphs, header_root, cfg)
     else:
         preprocess_all_unnumbered(paragraphs)
@@ -1536,7 +1598,7 @@ def preview_only(input_path):
     cfg = MODE_CONFIGS[mode]
     print(f"[감지] 문서 유형: {cfg['label']}")
 
-    if mode in ("exhibit_b_nonum", "exhibit_sa_nonum", "exhibit_e_nonum"):
+    if mode in ("exhibit_b_nonum", "exhibit_sa_nonum", "exhibit_e_nonum", "attachment_nonum"):
         _preview_nonum(paragraphs, header_root, cfg)
     else:
         preprocess_all_unnumbered(paragraphs)
