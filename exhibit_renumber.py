@@ -87,7 +87,7 @@ REFERENCE_LIST_RE = re.compile(r"^(?:\d+[\.\s]+)?참고자료\s*\d+|^\d+(?:-\d+)
 # 첨부서류 (성년후견 심판청구서 등)
 ATTACHMENT_RE = re.compile(r"첨부서류\s*(\d+)\.?")
 ATTACHMENT_NONUM_RE = re.compile(r"첨부서류\s+(?=[^\s\d])")
-ATTACHMENT_LIST_RE = re.compile(r"^(?:\d+[\.\s]+)?(?:첨부서류\s*\d+|\d+\.\s+\S)")
+ATTACHMENT_LIST_RE = re.compile(r"^(?:\d+[\.\s]+)?(?:첨부서류\s*\d+|\d{1,3}\.\s+[가-힣])")
 
 # 하위번호 패턴 (평탄화용) — 구형식(제N-M호증)과 신형식(제N호증의 M) 모두 지원
 _EXHIBIT_SUB_PATTERNS = [
